@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Result</title>
+     <style>
+        body { font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 700px; margin: auto; text-align: center; }
+        video { max-width: 100%; height: auto; margin-top: 20px; border: 1px solid #ccc; }
+        a { display: inline-block; margin-top: 20px; padding: 10px 15px; background-color: #28a745; color: white; text-decoration: none; border-radius: 4px; }
+        a:hover { background-color: #218838; }
+        .error { color: red; font-weight: bold; margin-top: 20px;}
+    </style>
+</head>
+<body>
+    <h1>Generated Promo Video</h1>
+
+    {% if video_url %}
+        <video controls>
+            <source src="{{ video_url }}" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+        <br>
+        <a href="{{ video_url }}" download="promo_video.mp4">Download Video</a>
+
+    {% else %}
+        <p class="error">Could not generate the video. Please check the logs or try again.</p>
+         <!-- Display specific error if passed -->
+         {% with messages = get_flashed_messages(category_filter=["error"]) %}
+            {% if messages %}
+                {% for message in messages %}
+                    <p class="error">{{ message }}</p>
+                {% endfor %}
+            {% endif %}
+         {% endwith %}
+    {% endif %}
+
+    <p><a href="{{ url_for('index') }}">Generate Another Video</a></p>
+
+</body>
+</html> 
