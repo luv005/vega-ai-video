@@ -3,51 +3,78 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Promo Video Generator</title>
+    <title>AI Promo Video Generator</title>
     <style>
         body { font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 600px; margin: auto; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="url"], input[type="file"] { width: 100%; padding: 8px; margin-bottom: 15px; border: 1px solid #ccc; box-sizing: border-box; }
-        button { padding: 10px 15px; background-color: #007bff; color: white; border: none; cursor: pointer; font-size: 1em; }
+        h1 { text-align: center; }
+        form { display: flex; flex-direction: column; gap: 15px; }
+        label { font-weight: bold; }
+        input[type="url"], input[type="file"], button, select { padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { background-color: #007bff; color: white; cursor: pointer; font-size: 1em; }
         button:hover { background-color: #0056b3; }
-        .flash-messages { list-style: none; padding: 0; margin-bottom: 15px; }
-        .flash-messages li { padding: 10px; margin-bottom: 10px; border-radius: 4px; }
-        .flash-messages .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .flash-messages .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .flash-error { color: red; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
+        .flash-success { color: green; background-color: #d4edda; border: 1px solid #c3e6cb; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
+        .avatar-section { border: 1px dashed #ccc; padding: 15px; border-radius: 4px; margin-top: 10px; }
+        .video-type-options label { margin-right: 15px; font-weight: normal; }
+        .video-type-options input[type="radio"] { margin-right: 5px; }
         .loader { border: 5px solid #f3f3f3; border-top: 5px solid #3498db; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; display: none; /* Hidden by default */ }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <h1>Generate Talking Avatar Promo Video</h1>
+    <h1>Generate Your Promo Video</h1>
 
     <!-- Flash Messages -->
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
-        <ul class="flash-messages">
         {% for category, message in messages %}
-          <li class="{{ category }}">{{ message }}</li>
+          <div class="flash-{{ category }}">{{ message }}</div>
         {% endfor %}
-        </ul>
       {% endif %}
     {% endwith %}
 
     <form id="promo-form" action="{{ url_for('generate_video_route') }}" method="post" enctype="multipart/form-data">
+
         <div>
-            <label for="product_url">Product Page URL:</label>
-            <input type="url" id="product_url" name="product_url" required placeholder="e.g., https://www.amazon.com/dp/B08N5WRWNW">
+            <label>Video Type:</label>
+            <div class="video-type-options">
+                <input type="radio" id="video_type_product" name="video_type" value="product" checked onchange="toggleAvatarUpload()">
+                <label for="video_type_product">Product Video (Image + Text)</label>
+                <br>
+                <input type="radio" id="video_type_avatar" name="video_type" value="avatar" onchange="toggleAvatarUpload()">
+                <label for="video_type_avatar">Avatar Video (Talking Head)</label>
+            </div>
         </div>
+
         <div>
-            <label for="avatar_file">Upload Custom Avatar (Optional, PNG/JPG/WEBP):</label>
-            <input type="file" id="avatar_file" name="avatar_file" accept="image/png, image/jpeg, image/webp">
-            <small>If no file is uploaded, a default avatar will be used.</small>
+            <label for="product_url">Product URL:</label>
+            <input type="url" id="product_url" name="product_url" required placeholder="e.g., https://www.amazon.com/dp/B0EXAMPLE">
         </div>
+
+        <div id="avatar-upload-section" class="avatar-section" style="display: none;"> <!-- Hidden by default -->
+            <label for="avatar_file">Upload Custom Avatar (Optional):</label>
+            <p style="font-size: 0.9em; color: #555;">If not provided, a default avatar will be used for the 'Avatar Video' type. Accepts PNG, JPG, WEBP (Max 16MB).</p>
+            <input type="file" id="avatar_file" name="avatar_file" accept=".png, .jpg, .jpeg, .webp">
+        </div>
+
         <button type="submit">Generate Video</button>
     </form>
 
     <div id="loading-indicator" class="loader"></div>
 
     <script>
+        function toggleAvatarUpload() {
+            const avatarSection = document.getElementById('avatar-upload-section');
+            const avatarRadio = document.getElementById('video_type_avatar');
+            if (avatarRadio.checked) {
+                avatarSection.style.display = 'block';
+            } else {
+                avatarSection.style.display = 'none';
+            }
+        }
+        // Initial check in case the page loads with 'avatar' checked (e.g., back button)
+        document.addEventListener('DOMContentLoaded', toggleAvatarUpload);
+
         // Show loader on form submission
         document.getElementById('promo-form').addEventListener('submit', function() {
             document.getElementById('loading-indicator').style.display = 'block';
