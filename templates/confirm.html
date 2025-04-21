@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirm Video Details</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            padding-top: 2rem;
+        }
+        .container {
+            max-width: 900px;
+            background-color: #ffffff;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .image-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-top: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .image-item {
+            position: relative;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            overflow: hidden;
+            aspect-ratio: 1 / 1; /* Make items square */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #e9ecef;
+        }
+        .image-item img {
+            max-width: 100%;
+            max-height: 100%;
+            display: block;
+            object-fit: contain; /* Use contain to see the whole image */
+        }
+        .image-item input[type="checkbox"] {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            /* Style checkbox for better visibility */
+            appearance: none;
+            background-color: rgba(255, 255, 255, 0.7);
+            border: 1px solid #adb5bd;
+            border-radius: 3px;
+            display: grid;
+            place-content: center;
+        }
+         .image-item input[type="checkbox"]::before {
+            content: "";
+            width: 0.8em;
+            height: 0.8em;
+            transform: scale(0);
+            transition: 120ms transform ease-in-out;
+            box-shadow: inset 1em 1em var(--bs-primary); /* Use Bootstrap primary color */
+             transform-origin: bottom left;
+             clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+        }
+        .image-item input[type="checkbox"]:checked::before {
+            transform: scale(1);
+        }
+        .image-item input[type="checkbox"]:checked {
+            background-color: var(--bs-primary);
+            border-color: var(--bs-primary);
+        }
+        .description-box {
+            max-height: 150px;
+            overflow-y: auto;
+            border: 1px solid #ced4da;
+            padding: 0.5rem;
+            background-color: #f8f9fa;
+            font-size: 0.9rem;
+            margin-top: 0.5rem;
+        }
+        .btn-confirm {
+            margin-top: 1.5rem;
+        }
+        /* Styles for loading and result */
+        #loadingIndicator {
+            display: none; /* Hidden by default */
+            text-align: center;
+            margin-top: 2rem;
+        }
+        #videoResult video {
+            max-width: 100%;
+            height: auto;
+            margin-top: 1rem;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+        }
+        #errorMessage {
+            display: none; /* Hidden by default */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mb-4">Confirm Video Details</h1>
+
+        <!-- Display initial flash messages (e.g., from previous step if any) -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                    {{ message }}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <!-- Error message area for JS -->
+        <div id="errorMessage" class="alert alert-danger alert-dismissible fade show" role="alert" style="display: none;">
+            <span id="errorMessageText"></span>
+            <button type="button" class="btn-close" onclick="document.getElementById('errorMessage').style.display='none';" aria-label="Close"></button>
+        </div>
+
+        <!-- Confirmation Form -->
+        <!-- Give the form an ID -->
+        <form id="confirmationForm" action="{{ url_for('create_video_route') }}" method="POST">
+            <div class="mb-3">
+                <label class="form-label"><strong>Product Title:</strong></label>
+                <p>{{ product_title }}</p>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label"><strong>Product Description:</strong></label>
+                <div class="description-box">
+                    <p>{{ product_description }}</p>
+                </div>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label"><strong>Select Images to Use:</strong></label>
+                {% if confirm_images %}
+                    <div class="image-grid">
+                        {% for img_relative_path in confirm_images %}
+                        <div class="image-item">
+                            <img src="{{ url_for('static', filename=img_relative_path) }}" alt="Product Image {{ loop.index }}">
+                            <!-- Ensure checkboxes have the name 'selected_images' -->
+                            <input type="checkbox" name="selected_images" value="{{ img_relative_path }}" checked>
+                        </div>
+                        {% endfor %}
+                    </div>
+                     <small class="form-text text-muted">Check the images you want to include in the video. (Max 5 recommended for slideshows).</small>
+                {% else %}
+                    <p class="text-muted">No product images were found or downloaded.</p>
+                {% endif %}
+            </div>
+
+            <!-- Buttons Area -->
+            <div id="buttonsArea" class="d-grid gap-2 d-md-flex justify-content-md-end">
+                 <a href="{{ url_for('index') }}" class="btn btn-secondary me-md-2">Cancel</a>
+                 <!-- Give button an ID -->
+                <button type="submit" id="confirmButton" class="btn btn-primary btn-confirm">
+                    Confirm and Generate {{ video_type.capitalize() }} Video
+                </button>
+            </div>
+        </form>
+
+        <!-- Loading Indicator Area -->
+        <div id="loadingIndicator">
+            <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            <p class="mt-2">Generating video, please wait... This might take a minute or two.</p>
+        </div>
+
+        <!-- Video Result Area -->
+        <div id="videoResult" class="mt-4">
+            <!-- Video player will be inserted here by JavaScript -->
+        </div>
+
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const form = document.getElementById('confirmationForm');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const videoResultDiv = document.getElementById('videoResult');
+        const buttonsArea = document.getElementById('buttonsArea');
+        const errorMessageDiv = document.getElementById('errorMessage');
+        const errorMessageText = document.getElementById('errorMessageText');
+        const confirmButton = document.getElementById('confirmButton');
+
+        form.addEventListener('submit', async function(event) {
+            event.preventDefault(); // Prevent default form submission
+
+            // Hide error message if previously shown
+            errorMessageDiv.style.display = 'none';
+            // Show loading indicator
+            loadingIndicator.style.display = 'block';
+            // Hide form buttons
+            buttonsArea.style.display = 'none';
+            // Clear previous results
+            videoResultDiv.innerHTML = '';
+
+            // Get selected image paths
+            const selectedImages = [];
+            const checkboxes = form.querySelectorAll('input[name="selected_images"]:checked');
+            checkboxes.forEach(checkbox => {
+                selectedImages.push(checkbox.value);
+            });
+
+            console.log('Selected images for submission:', selectedImages);
+
+            try {
+                const response = await fetch(form.action, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                        // Add CSRF token header if you implement CSRF protection
+                    },
+                    body: JSON.stringify({ selected_images: selectedImages })
+                });
+
+                // Hide loading indicator regardless of outcome
+                loadingIndicator.style.display = 'none';
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    // Success! Display the video
+                    console.log('Video generated:', result.video_url);
+                    const videoElement = document.createElement('video');
+                    videoElement.src = result.video_url;
+                    videoElement.controls = true;
+                    videoElement.width = 600; // Adjust width as needed
+                    videoResultDiv.appendChild(videoElement);
+                    // Optionally add a success message or download link
+                    const successMsg = document.createElement('p');
+                    successMsg.className = 'text-success mt-2';
+                    successMsg.textContent = 'Video generated successfully!';
+                    videoResultDiv.appendChild(successMsg);
+
+                } else {
+                    // Error occurred
+                    const errorMsg = result.error || 'An unknown error occurred during video generation.';
+                    console.error('Generation failed:', errorMsg);
+                    errorMessageText.textContent = errorMsg;
+                    errorMessageDiv.style.display = 'block';
+                    // Show buttons again on error
+                    buttonsArea.style.display = 'flex'; // Use flex to restore layout
+                }
+
+            } catch (error) {
+                // Network error or JSON parsing error
+                console.error('Fetch error:', error);
+                loadingIndicator.style.display = 'none';
+                errorMessageText.textContent = 'A network error occurred. Please try again. (' + error + ')';
+                errorMessageDiv.style.display = 'block';
+                 // Show buttons again on error
+                buttonsArea.style.display = 'flex';
+            }
+        });
+    </script>
+</body>
+</html> 

@@ -5,17 +5,18 @@ import requests
 import base64
 import textwrap # Import textwrap for description formatting
 from bs4 import BeautifulSoup
-from flask import Flask, request, render_template, redirect, url_for, send_from_directory, flash
+from flask import Flask, request, render_template, redirect, url_for, send_from_directory, flash, session, jsonify
 from openai import OpenAI
 from dotenv import load_dotenv
 # Ensure these are imported
 from moviepy.editor import (VideoFileClip, ImageClip, CompositeVideoClip, ColorClip,
                             TextClip, concatenate_videoclips, AudioFileClip) # Added ColorClip, TextClip, concatenate, AudioFileClip
 from moviepy.video.fx.all import fadein, fadeout # Import fade effects
-from PIL import Image, ImageOps, ImageFont, ImageDraw # Import more from Pillow
+from PIL import Image, ImageOps, ImageFont, ImageDraw, ImageFilter # Import more from Pillow and ImageFilter
 import numpy as np
 import math # For ceiling function
 import platform # Import platform module
+import shutil # For potential temporary directory cleanup
 
 # --- Configuration ---
 # load_dotenv()  # Load environment variables from .env file
@@ -28,7 +29,7 @@ try:
         # On macOS/Linux with IMv7+, 'magick' is the command.
         # Set the environment variable *for this script's execution context*.
         print("Attempting to configure MoviePy for ImageMagick 7+ ('magick' command)...")
-        os.environ["IMAGEMAGICK_BINARY"] = "magick"
+        os.environ["IMAGEMAGICK_BINARY"] = "/opt/homebrew/bin/magick" # Or the actual path from 'which magick'
         # You might need to verify 'magick' is actually in your system's PATH
         # If it still fails, you might need the full path, e.g., "/usr/local/bin/magick" or "/opt/homebrew/bin/magick"
         # Example: os.environ["IMAGEMAGICK_BINARY"] = "/opt/homebrew/bin/magick"
@@ -43,16 +44,18 @@ except Exception as e:
 # --- End ImageMagick Configuration ---
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24) # Needed for flashing messages
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', os.urandom(24)) # Needed for flashing messages
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['GENERATED_FOLDER'] = os.path.join('static', 'generated')
+app.config['CONFIRM_FOLDER'] = os.path.join(app.config['GENERATED_FOLDER'], 'confirm_temp')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Max upload size 16MB
 app.config['FONT_PATH'] = 'fonts/Poppins-Bold.ttf' # CHANGE TO YOUR POPPINS BOLD FILENAME
-MAX_PRODUCT_IMAGES = 5 # Limit the number of images to process
+MAX_PRODUCT_IMAGES = 8 # Limit the number of images to process
 
 # Ensure upload and generated directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['GENERATED_FOLDER'], exist_ok=True)
+os.makedirs(app.config['CONFIRM_FOLDER'], exist_ok=True) # Create confirm folder
 
 # Ensure font directory exists if using a bundled font
 font_dir = os.path.dirname(app.config['FONT_PATH'])
@@ -431,34 +434,32 @@ def get_word_timestamps(audio_path):
         print(f"Error calling OpenAI Whisper API for timestamps: {e}")
         return None
 
-# --- MODIFIED Helper: Generate Slideshow Video with Rounded Captions and Clearer Images ---
+# --- MODIFIED Helper: Generate Slideshow Video with Cropped Images ---
 def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
-    """Generates slideshow with adaptive frame size, rounded captions, and clearer product images."""
-    print("Starting slideshow video generation with improved image quality...")
-    
-    # Default dimensions (will be adjusted based on images)
+    """Generates slideshow with images cropped to fit frame, adaptive frame size, and rounded captions."""
+    print("Starting slideshow video generation with images cropped to fit frame...")
+
+    # Frame dimensions (will be adjusted based on images)
     DEFAULT_W, DEFAULT_H = 1920, 1080  # 16:9 default
     PORTRAIT_W, PORTRAIT_H = 1080, 1920  # 9:16 portrait
     SQUARE_W, SQUARE_H = 1440, 1440  # 1:1 square
-    
+
     output_fps = 30
-    fade_duration = 0.5
-    
-    # Caption settings
+    fade_duration = 0.5 # Duration for fade between images
+
+    # Caption settings (adjust as needed)
     caption_font_size = 55
     caption_color = 'white'
     caption_bg_color = 'black' # Solid black background
-    caption_padding = 20 # Pixels around text for the background
-    caption_corner_radius = 25 # Pixels for rounded corners
-    caption_max_words_per_segment = 4  # Show 3-4 words at a time
-    caption_max_duration_per_segment = 2.5  # Max seconds per caption segment
-    
-    # Position captions near bottom with space below
-    caption_bottom_margin = 50  # Pixels from bottom of frame
-    
-    # Image quality settings
-    image_quality = Image.Resampling.LANCZOS  # Highest quality resampling
-    
+    caption_padding = 20
+    caption_corner_radius = 25
+    caption_max_words_per_segment = 4
+    caption_max_duration_per_segment = 2.5
+    caption_bottom_margin = 50
+
+    # Image quality settings (LANCZOS is good for resizing)
+    image_resampling_quality = Image.Resampling.LANCZOS
+
     clips = []
     audio_clip = None
     final_video_sequence = None
@@ -466,242 +467,220 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
     text_clips_list = []
 
     try:
-        # 1. Analyze images to determine optimal frame size
+        # 1. Analyze images to determine optimal frame size (existing logic)
         print("Analyzing images to determine optimal frame size...")
         aspect_ratios = []
-        
+        valid_image_paths = [] # Keep track of images that can be opened
         for img_path in image_paths:
             try:
                 with Image.open(img_path) as img:
                     w, h = img.size
-                    aspect_ratios.append(w / h)
+                    if w > 0 and h > 0: # Basic validation
+                        aspect_ratios.append(w / h)
+                        valid_image_paths.append(img_path) # Add valid path
+                    else:
+                        print(f"Warning: Image {img_path} has zero dimension.")
             except Exception as e:
                 print(f"Warning: Could not analyze image {img_path}: {e}")
-        
+
         if not aspect_ratios:
             print("No valid images to analyze. Using default 16:9 ratio.")
             W, H = DEFAULT_W, DEFAULT_H
         else:
-            # Calculate average aspect ratio
             avg_aspect = sum(aspect_ratios) / len(aspect_ratios)
             print(f"Average image aspect ratio: {avg_aspect:.2f}")
-            
-            # Determine frame type based on average aspect ratio
-            if avg_aspect < 0.8:  # Portrait-oriented images (tall)
-                W, H = PORTRAIT_W, PORTRAIT_H
-                print("Using portrait 9:16 frame (1080x1920)")
-            elif avg_aspect > 1.2:  # Landscape-oriented images (wide)
-                W, H = DEFAULT_W, DEFAULT_H
-                print("Using landscape 16:9 frame (1920x1080)")
-            else:  # Near-square images
-                W, H = SQUARE_W, SQUARE_H
-                print("Using square 1:1 frame (1440x1440)")
-        
+            if avg_aspect < 0.8: W, H = PORTRAIT_W, PORTRAIT_H; print("Using portrait 9:16 frame (1080x1920)")
+            elif avg_aspect > 1.2: W, H = DEFAULT_W, DEFAULT_H; print("Using landscape 16:9 frame (1920x1080)")
+            else: W, H = SQUARE_W, SQUARE_H; print("Using square 1:1 frame (1440x1440)")
+
         target_aspect = W / H
-        
-        # 2. Load Audio & Get Timestamps
+
+        # 2. Load Audio & Get Timestamps (existing logic)
+        print("Loading audio and getting word timestamps...")
         audio_clip = AudioFileClip(audio_path)
         total_duration = audio_clip.duration
-        word_timestamps = get_word_timestamps(audio_path)
-        if word_timestamps is None:
-            print("Warning: Could not get word timestamps. Proceeding without captions.")
+        word_timestamps = get_word_timestamps(audio_path) # Use helper
+        if not word_timestamps:
+            print("Warning: Could not get word timestamps. Captions will not be generated.")
 
-        if not image_paths: print("Error: No valid image paths provided."); return False
-        num_images = len(image_paths)
-        slide_duration = total_duration / num_images
-        print(f"Audio duration: {total_duration:.2f}s, {num_images} images, slide duration: {slide_duration:.2f}s")
+        # 3. Calculate Image Durations (existing logic)
+        num_images = len(valid_image_paths)
+        if num_images == 0: raise ValueError("No valid images provided for slideshow.")
+        base_image_duration = total_duration / num_images
+        print(f"Total duration: {total_duration:.2f}s, Num images: {num_images}, Base duration/image: {base_image_duration:.2f}s")
 
-        # 3. Process images and create base video clips (Fill Frame Logic with improved quality)
-        for i, img_path in enumerate(image_paths):
-            print(f"Processing image {i+1}/{num_images}: {os.path.basename(img_path)}")
+        # 4. Create Image Clips with Crop-to-Fit
+        print(f"Processing {num_images} images for slideshow frame {W}x{H}...")
+        current_time = 0
+        for i, img_path in enumerate(valid_image_paths):
+            start_time = current_time
+            # Ensure last clip ends exactly at total_duration
+            end_time = min(start_time + base_image_duration, total_duration) if i < num_images - 1 else total_duration
+            duration = end_time - start_time
+            if duration <= 0: continue # Skip zero-duration clips
+
             try:
-                # Load image with Pillow
-                img_pil = Image.open(img_path).convert("RGB")
-                img_w, img_h = img_pil.size
-                print(f"  Original size: {img_w}x{img_h}")
-                img_aspect = img_w / img_h
-                
-                # --- IMPROVED Image Processing Logic ---
-                if img_aspect > target_aspect:
-                    # Image is wider than target: Resize based on height, crop width
-                    print("  -> Image is wider. Resizing height and cropping width.")
-                    new_h = H
-                    new_w = int(new_h * img_aspect)
-                    
-                    # Use high quality resizing
-                    resized_img = img_pil.resize((new_w, new_h), image_quality)
-                    
-                    # Calculate crop to center the image horizontally
-                    crop_x = (new_w - W) / 2
-                    crop_box = (crop_x, 0, new_w - crop_x, new_h)
-                    final_img = resized_img.crop(crop_box)
-                    resized_img.close()
-                else:
-                    # Image is taller than or equal aspect to target: Resize based on width, crop height
-                    print("  -> Image is taller or same aspect. Resizing width and cropping height.")
-                    new_w = W
-                    new_h = int(new_w / img_aspect)
-                    
-                    # Use high quality resizing
-                    resized_img = img_pil.resize((new_w, new_h), image_quality)
-                    
-                    # Calculate crop to center the image vertically
-                    crop_y = (new_h - H) / 2
-                    crop_box = (0, crop_y, new_w, new_h - crop_y)
-                    final_img = resized_img.crop(crop_box)
-                    resized_img.close()
+                print(f"Processing image {i+1}: {os.path.basename(img_path)} for duration {duration:.2f}s")
+                with Image.open(img_path).convert("RGB") as img: # Convert to RGB
+                    img_w, img_h = img.size
+                    img_aspect = img_w / img_h
 
-                img_pil.close()
+                    # --- CROP-TO-FIT LOGIC ---
+                    if abs(img_aspect - target_aspect) < 0.01: # If aspect ratios are very close, just resize
+                        print("  Aspect ratio matches frame. Resizing...")
+                        resized_img = img.resize((W, H), image_resampling_quality)
+                    elif img_aspect > target_aspect: # Image is wider than frame: Resize based on height, crop width
+                        print("  Image wider than frame. Resizing height and cropping width...")
+                        new_height = H
+                        new_width = int(new_height * img_aspect)
+                        resized_img = img.resize((new_width, new_height), image_resampling_quality)
+                        # Calculate horizontal crop
+                        crop_amount = new_width - W
+                        left = crop_amount // 2
+                        right = left + W
+                        resized_img = resized_img.crop((left, 0, right, new_height))
+                    else: # Image is taller than frame: Resize based on width, crop height
+                        print("  Image taller than frame. Resizing width and cropping height...")
+                        new_width = W
+                        new_height = int(new_width / img_aspect)
+                        resized_img = img.resize((new_width, new_height), image_resampling_quality)
+                        # Calculate vertical crop
+                        crop_amount = new_height - H
+                        top = crop_amount // 2
+                        bottom = top + H
+                        resized_img = resized_img.crop((0, top, new_width, bottom))
+                    # --- END CROP-TO-FIT ---
 
-                # Ensure final image is exactly WxH
-                if final_img.size != (W, H):
-                     print(f"  -> Final size was {final_img.size}, resizing to {W}x{H}")
-                     final_img = final_img.resize((W, H), image_quality)
+                    # Convert PIL image to numpy array for MoviePy
+                    img_array = np.array(resized_img)
 
-                print(f"  -> Final frame size for clip: {final_img.size}")
+                    # Create ImageClip
+                    img_clip = ImageClip(img_array).set_duration(duration).set_start(start_time)
 
-                # Create MoviePy ImageClip with the processed image
-                img_clip = ImageClip(np.array(final_img)).set_duration(slide_duration)
-                clips.append(img_clip)
-                final_img.close()
+                    # Add fade effect (except for the first image)
+                    if i > 0:
+                        img_clip = img_clip.fadein(fade_duration / 2) # Fade in overlaps previous fade out
 
-            except Exception as img_proc_err:
-                print(f"Warning: Failed to process image {img_path}: {img_proc_err}. Skipping.")
-                if 'img_pil' in locals() and img_pil: img_pil.close()
-                if 'resized_img' in locals() and resized_img: resized_img.close()
-                if 'final_img' in locals() and final_img: final_img.close()
-                continue
+                    # Add to clips list
+                    clips.append(img_clip)
 
-        if not clips: print("Error: No image clips created."); return False
+            except Exception as e:
+                print(f"Error processing image {img_path}: {e}. Skipping.")
+                # Adjust duration distribution if an image fails? Maybe not necessary for simple cases.
+                # If skipping, we need to adjust total_duration or redistribute time,
+                # but for simplicity, we'll let the timeline have a gap or end early.
+                # A better approach would recalculate durations.
 
-        # 4. Concatenate base video clips
-        video_sequence = concatenate_videoclips(clips, method="compose")
+            current_time = end_time # Move to the start time for the next clip
 
-        # 5. Group Word Timestamps into Small Segments (3-4 words each)
-        caption_segments = []
+        if not clips: raise ValueError("No valid image clips could be created.")
+
+        # 5. Concatenate Image Clips with Crossfade
+        print("Concatenating image clips with crossfade...")
+        # Apply crossfade by overlapping fadein/fadeout
+        video_sequence = concatenate_videoclips(clips, method="compose") # Use compose for overlapping fades
+        # Ensure final duration matches audio
+        video_sequence = video_sequence.set_duration(total_duration)
+
+        # 6. Create Caption Clips (MODIFIED ACCESS METHOD)
         if word_timestamps:
-            print("Grouping word timestamps into small caption segments...")
-            current_segment_words = []
-            segment_start_time = -1
-            segment_end_time = -1
+            print("Generating caption clips...")
+            font_param = font_path # Use the provided font path directly
+            if not os.path.exists(font_param):
+                print(f"Warning: Font file not found at {font_param}. MoviePy might use a default.")
+                # On some systems, you might need to provide a system font name like "Arial-Bold"
+                # font_param = "Arial-Bold" # Example fallback
 
+            current_caption_start = 0
+            segment_words = []
+            segment_start_time = 0
+
+            # --- MODIFICATION START ---
+            # Iterate through word_timestamps using dot notation
             for i, word_info in enumerate(word_timestamps):
-                word_text = word_info.word.strip()
+                # Access attributes using dot notation
+                word = word_info.word
                 start = word_info.start
                 end = word_info.end
+            # --- MODIFICATION END ---
 
-                if not current_segment_words:
-                    # Start of a new segment
-                    current_segment_words.append(word_text)
+                if not segment_words: # Start of a new segment
                     segment_start_time = start
-                    segment_end_time = end
-                else:
-                    # Check if adding this word exceeds limits
-                    time_diff = end - segment_start_time
-                    word_count = len(current_segment_words) + 1
 
-                    if time_diff < caption_max_duration_per_segment and word_count <= caption_max_words_per_segment:
-                        # Add word to current segment
-                        current_segment_words.append(word_text)
-                        segment_end_time = end # Update end time
-                    else:
-                        # Finalize the previous segment
-                        segment_text = " ".join(current_segment_words)
-                        caption_segments.append({
-                            "text": segment_text,
-                            "start": segment_start_time,
-                            "end": segment_end_time
-                        })
-                        # Start a new segment with the current word
-                        current_segment_words = [word_text]
-                        segment_start_time = start
-                        segment_end_time = end
+                segment_words.append(word)
+                current_duration = end - segment_start_time
+                is_last_word = (i == len(word_timestamps) - 1)
 
-                # Add the last segment if loop finishes
-                if i == len(word_timestamps) - 1 and current_segment_words:
-                    segment_text = " ".join(current_segment_words)
-                    caption_segments.append({
-                        "text": segment_text,
-                        "start": segment_start_time,
-                        "end": segment_end_time
-                    })
-            print(f"Grouped into {len(caption_segments)} caption segments.")
+                # Check if segment should end
+                if len(segment_words) >= caption_max_words_per_segment or \
+                   current_duration >= caption_max_duration_per_segment or \
+                   is_last_word:
 
-        # 6. Create Timed Composite Caption Clips (Text + Rounded Background)
-        if caption_segments:
-            print("Creating timed composite caption clips...")
-            if not os.path.exists(font_path):
-                 print(f"Warning: Caption font file not found at '{font_path}'. Using default."); font_param = 'Arial-Bold'
-            else: font_param = font_path
+                    text = " ".join(segment_words)
+                    # Use the 'end' time from the current word_info object
+                    duration = end - segment_start_time
+                    start_time = segment_start_time
 
-            for segment in caption_segments:
-                text = segment["text"]
-                start_time = segment["start"]
-                end_time = segment["end"]
-                duration = end_time - start_time
+                    print(f"  Caption: '{text}' | Start: {start_time:.2f} | Duration: {duration:.2f}")
 
-                if duration <= 0: continue
+                    # --- Create Rounded Background ---
+                    # Estimate text size first (might need adjustment)
+                    try:
+                        # Use TextClip to estimate size first (a bit inefficient but often necessary)
+                        temp_text_clip = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, method='label')
+                        txt_w, txt_h = temp_text_clip.size
+                        temp_text_clip.close() # Close the temporary clip
 
-                # --- Create Text Clip (without background first) to get size ---
-                temp_text_clip = TextClip(text, fontsize=caption_font_size, color=caption_color,
-                                           font=font_param, method='label') # Use label to get natural size
-                txt_w, txt_h = temp_text_clip.size
-                temp_text_clip.close() # Close temporary clip
+                        bg_w = txt_w + 2 * caption_padding
+                        bg_h = txt_h + 2 * caption_padding
 
-                # --- Calculate background size with padding ---
-                bg_w = txt_w + 2 * caption_padding
-                bg_h = txt_h + 2 * caption_padding
+                        # Create background image with Pillow
+                        bg_image = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0)) # Transparent background
+                        draw = ImageDraw.Draw(bg_image)
+                        # Draw rounded rectangle (black with some transparency maybe?)
+                        # Use solid black for now as requested
+                        draw.rounded_rectangle(
+                            (0, 0, bg_w, bg_h),
+                            radius=caption_corner_radius,
+                            fill=caption_bg_color # Use solid black
+                        )
+                        # Convert Pillow image to MoviePy clip
+                        bg_clip = ImageClip(np.array(bg_image), ismask=False, transparent=True).set_opacity(1.0)
+                    except Exception as pil_err:
+                        print(f"Warning: Failed to create rounded background image: {pil_err}. Using simple TextClip.")
+                        # Fallback to simple TextClip with background
+                        y_pos = H - caption_bottom_margin - 50 # Estimate height
+                        txt_clip = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, bg_color=caption_bg_color, method='caption', align='center', size=(W*0.8, None))
+                        # Use the 'start' and 'duration' calculated above
+                        txt_clip = txt_clip.set_position(('center', y_pos)).set_start(start_time).set_duration(duration)
+                        text_clips_list.append(txt_clip)
+                        # Reset segment and continue
+                        segment_words = []
+                        continue # Skip the rest of the loop for this segment
 
-                # --- Create Rounded Background using Pillow ---
-                try:
-                    # Create a transparent image for the background
-                    bg_image = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0))
-                    draw = ImageDraw.Draw(bg_image)
-                    # Draw the rounded rectangle with solid black fill
-                    draw.rounded_rectangle(
-                        [(0, 0), (bg_w, bg_h)],
-                        radius=caption_corner_radius,
-                        fill=caption_bg_color # Use solid black
-                    )
-                    # Convert Pillow image to MoviePy ImageClip
-                    bg_clip = ImageClip(np.array(bg_image), ismask=False, transparent=True)
-                    bg_clip = bg_clip.set_opacity(1.0) # Ensure it's fully opaque
+                    # --- Create Final Text Clip ---
+                    text_clip_final = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, method='label', align='center')
 
-                except Exception as pil_err:
-                    print(f"Warning: Failed to create rounded background image: {pil_err}. Using simple TextClip.")
-                    # Fallback: Create simple text clip if Pillow fails
-                    txt_clip = TextClip(text, fontsize=caption_font_size, color=caption_color,
-                                         font=font_param, bg_color=caption_bg_color, # Use simple bg color
-                                          method='caption', align='center', size=(W*0.8, None))
-                    
-                    # Calculate position with bottom margin
-                    y_pos = H - caption_bottom_margin - txt_clip.h
-                    txt_clip = txt_clip.set_position(('center', y_pos))
-                    txt_clip = txt_clip.set_start(start_time).set_duration(duration)
-                    text_clips_list.append(txt_clip)
-                    continue # Skip the compositing part for this segment
+                    # --- Composite Text onto Rounded Background ---
+                    caption_clip = CompositeVideoClip([
+                        bg_clip.set_position('center'),
+                        text_clip_final.set_position('center')
+                    ], size=(bg_w, bg_h))
 
-                # --- Create Final Text Clip (potentially with wrapping if needed) ---
-                text_clip_final = TextClip(text, fontsize=caption_font_size, color=caption_color,
-                                           font=font_param, method='label', align='center')
+                    # Set timing and position for the composite caption
+                    y_pos = H - caption_bottom_margin - caption_clip.h # Position based on composite height
+                    caption_clip = caption_clip.set_position(('center', y_pos))
+                    # Use the 'start' and 'duration' calculated above
+                    caption_clip = caption_clip.set_start(start_time).set_duration(duration)
 
-                # --- Composite Text onto Rounded Background ---
-                caption_clip = CompositeVideoClip([
-                    bg_clip.set_position('center'),
-                    text_clip_final.set_position('center')
-                ], size=(bg_w, bg_h))
+                    text_clips_list.append(caption_clip)
 
-                # Set timing and position for the composite caption
-                # Calculate position with bottom margin
-                y_pos = H - caption_bottom_margin - caption_clip.h
-                caption_clip = caption_clip.set_position(('center', y_pos))
-                caption_clip = caption_clip.set_start(start_time).set_duration(duration)
+                    # Close intermediate clips
+                    bg_clip.close()
+                    text_clip_final.close()
 
-                text_clips_list.append(caption_clip)
-
-                # Close intermediate clips
-                bg_clip.close()
-                text_clip_final.close()
+                    # Reset for next segment
+                    segment_words = []
 
             print(f"Created {len(text_clips_list)} composite caption clips.")
 
@@ -710,13 +689,12 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         final_composite_elements = [video_sequence]
         if text_clips_list:
             final_composite_elements.extend(text_clips_list)
-
+        # Ensure the final composite uses the determined W, H
         final_video_sequence = CompositeVideoClip(final_composite_elements, size=(W, H))
-        final_video_sequence = final_video_sequence.set_duration(total_duration)
-        final_video_sequence = final_video_sequence.set_audio(audio_clip)
+        final_video_sequence = final_video_sequence.set_duration(total_duration).set_audio(audio_clip)
 
-        # 8. Add Overall Fade In/Out
-        final_video_sequence = final_video_sequence.fadein(fade_duration).fadeout(fade_duration)
+        # 8. Add Overall Fade In/Out (Optional, applied to the whole sequence)
+        # final_video_sequence = final_video_sequence.fadein(fade_duration).fadeout(fade_duration)
 
         # 9. Write Video File
         print(f"Writing final slideshow video with dimensions {W}x{H} to: {output_path}")
@@ -740,9 +718,9 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         if audio_clip: audio_clip.close()
         if final_video_sequence: final_video_sequence.close()
         if 'video_sequence' in locals() and video_sequence: video_sequence.close()
-        for clip in clips:
+        for clip in clips: # Close individual image clips
             if clip: clip.close()
-        for clip in text_clips_list:
+        for clip in text_clips_list: # Close caption clips
              if clip: clip.close()
 
 # --- Flask Routes ---
@@ -750,238 +728,330 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
 @app.route('/', methods=['GET'])
 def index():
     """Renders the main form page."""
+    # Clear any previous session data on loading the main page
+    session.pop('confirm_data', None)
+    session.pop('confirm_images', None)
     return render_template('index.html')
 
+# MODIFIED: This route now handles scraping and shows the confirmation page
 @app.route('/generate', methods=['POST'])
-def generate_video_route():
-    """Handles form submission, processing, and shows results."""
+def generate_confirmation_route():
+    """Handles initial form submission, scrapes data, downloads images,
+       and renders the confirmation page."""
     product_url = request.form.get('product_url')
-    avatar_file = request.files.get('avatar_file')
+    avatar_file = request.files.get('avatar_file') # Keep track of avatar file if provided
     video_type = request.form.get('video_type', 'product')
 
     if not product_url:
         flash("Product URL is required.", "error")
         return redirect(url_for('index'))
 
-    # --- Common Setup ---
-    uploaded_image_path = None
-    avatar_source_url = DEFAULT_AVATAR_URL
-    product_image_urls = [] # Now a list
-    downloaded_image_paths = [] # List of paths for downloaded images
+    uploaded_avatar_path_relative = None # Store relative path for session
+
+    # --- Handle Avatar Upload (if provided) ---
+    # We save it now so it's available if the user confirms
+    if video_type == 'avatar' and avatar_file and avatar_file.filename != '':
+        try:
+            _, ext = os.path.splitext(avatar_file.filename)
+            if ext.lower() not in ['.png', '.jpg', '.jpeg', '.webp']:
+                 flash("Invalid image file type for avatar. Please use PNG, JPG, JPEG, or WEBP.", "error")
+                 return redirect(url_for('index'))
+            unique_filename = f"avatar_{uuid.uuid4()}{ext}"
+            # Save to UPLOAD_FOLDER, not confirm folder
+            uploaded_avatar_path_absolute = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            avatar_file.save(uploaded_avatar_path_absolute)
+            # Store the relative path for later use if confirmed
+            uploaded_avatar_path_relative = os.path.join(os.path.basename(app.config['UPLOAD_FOLDER']), unique_filename)
+            print(f"Temporarily saved uploaded avatar: {uploaded_avatar_path_relative}")
+        except Exception as e:
+            flash(f"Error saving uploaded avatar file: {e}", "error")
+            return redirect(url_for('index'))
+
+    # --- Scrape Product Data ---
+    print(f"Scraping product data from: {product_url}")
+    scraped_data = scrape_product_data(product_url)
+    if not scraped_data:
+        flash("Failed to scrape product data. Check URL or website structure.", "error")
+        return redirect(url_for('index'))
+
+    product_image_urls = scraped_data.get('image_urls', [])
+    product_title = scraped_data.get('title', 'Product')
+    product_description = scraped_data.get('description', 'No description found.')
+
+    if not product_image_urls:
+        flash("Could not find any product images on the provided page.", "warning")
+        # Allow proceeding without images for avatar-only? Or redirect?
+        # For now, let's show confirmation even without images, user might want avatar only.
+        # If video_type is 'product', we should probably redirect here.
+        if video_type == 'product':
+             flash("No product images found, cannot generate product slideshow.", "error")
+             return redirect(url_for('index'))
+
+
+    # --- Download Scraped Images Temporarily for Confirmation ---
+    confirm_image_details = [] # List of dicts: {'absolute_path': ..., 'relative_path': ...}
+    print(f"Downloading up to {MAX_PRODUCT_IMAGES} images for confirmation...")
+    confirm_folder_basename = os.path.basename(app.config['CONFIRM_FOLDER']) # e.g., 'confirm_temp'
+    generated_folder_basename = os.path.basename(app.config['GENERATED_FOLDER']) # e.g., 'generated'
+
+    for i, img_url in enumerate(product_image_urls):
+        try:
+            img_ext = os.path.splitext(img_url)[1] or ".jpg"
+            # Ensure extension is valid image type
+            if img_ext.lower() not in ['.png', '.jpg', '.jpeg', '.webp', '.gif']:
+                img_ext = ".jpg" # Default to jpg if extension is weird
+            img_filename = f"confirm_{i}_{uuid.uuid4()}{img_ext}"
+            # Save images inside the 'confirm_temp' subfolder within 'generated'
+            img_path_absolute = os.path.join(app.config['CONFIRM_FOLDER'], img_filename)
+            if download_image(img_url, img_path_absolute):
+                # Store relative path for use in template and session
+                # Path relative to 'static' folder: e.g., 'generated/confirm_temp/confirm_0_xyz.jpg'
+                img_path_relative = os.path.join(generated_folder_basename, confirm_folder_basename, img_filename).replace("\\", "/")
+                confirm_image_details.append({
+                    'absolute_path': img_path_absolute,
+                    'relative_path': img_path_relative
+                })
+                print(f"Downloaded confirmation image: {img_path_relative}")
+            else:
+                print(f"Warning: Failed to download confirmation image {i+1}: {img_url}")
+        except Exception as e:
+             print(f"Error downloading confirmation image {i+1}: {e}")
+        if len(confirm_image_details) >= MAX_PRODUCT_IMAGES:
+            break # Stop if we hit the max
+
+    if not confirm_image_details and video_type == 'product':
+         flash("Failed to download any valid product images for confirmation.", "error")
+         # Clean up avatar if it was uploaded
+         if uploaded_avatar_path_relative:
+             try: os.remove(os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(uploaded_avatar_path_relative)))
+             except: pass
+         return redirect(url_for('index'))
+
+    # --- Store data in session for the next step ---
+    session['confirm_data'] = {
+        'product_title': product_title,
+        'product_description': product_description,
+        'video_type': video_type,
+        'uploaded_avatar_relative_path': uploaded_avatar_path_relative # Store relative path or None
+    }
+    # Store only the relative paths and absolute paths for cleanup later
+    session['confirm_images'] = [{'relative_path': img['relative_path'], 'absolute_path': img['absolute_path']} for img in confirm_image_details]
+
+    print("Rendering confirmation page...")
+    # Pass only relative paths to the template
+    return render_template('confirm.html',
+                           product_title=product_title,
+                           product_description=product_description,
+                           confirm_images=[img['relative_path'] for img in confirm_image_details], # Pass only relative paths
+                           video_type=video_type)
+
+
+# NEW Route: Handles the actual video creation after confirmation
+@app.route('/create_video', methods=['POST'])
+def create_video_route():
+    """Handles confirmation form submission asynchronously and generates the final video.
+       Returns JSON response."""
+    print("Received ASYNC request to create video after confirmation.")
+
+    # --- Retrieve data from session ---
+    confirm_data = session.get('confirm_data')
+    confirm_images_info = session.get('confirm_images', [])
+
+    if not confirm_data:
+        print("Error: Session data missing.")
+        # Return JSON error
+        return jsonify({'success': False, 'error': 'Session expired or data missing. Please start over.'}), 400
+
+    # --- Retrieve selected images from the POST request body (sent as JSON) ---
+    try:
+        request_data = request.get_json()
+        if not request_data:
+            raise ValueError("Missing JSON data in request")
+        selected_relative_paths = request_data.get('selected_images', [])
+        if not isinstance(selected_relative_paths, list):
+             raise ValueError("selected_images should be a list")
+    except Exception as e:
+        print(f"Error parsing request JSON: {e}")
+        return jsonify({'success': False, 'error': f'Invalid request format: {e}'}), 400
+
+
+    # --- Get data stored in session ---
+    product_title = confirm_data.get('product_title', 'Product')
+    product_description = confirm_data.get('product_description', '')
+    video_type = confirm_data.get('video_type', 'product')
+    uploaded_avatar_relative_path = confirm_data.get('uploaded_avatar_relative_path')
+
+    print(f"Retrieved from session: Title='{product_title}', VideoType='{video_type}', Avatar='{uploaded_avatar_relative_path}'")
+    print(f"Selected image relative paths from JSON request: {selected_relative_paths}")
+
+    # --- Map selected relative paths back to absolute paths ---
+    selected_absolute_paths = []
+    path_map = {img['relative_path']: img['absolute_path'] for img in confirm_images_info}
+    for rel_path in selected_relative_paths:
+        abs_path = path_map.get(rel_path)
+        if abs_path and os.path.exists(abs_path):
+            selected_absolute_paths.append(abs_path)
+        else:
+            print(f"Warning: Selected image path not found or invalid: {rel_path}")
+
+    print(f"Selected image absolute paths for generation: {selected_absolute_paths}")
+
+    # --- Common Setup for Generation ---
     final_video_path = None
     final_video_filename = None
-    generated_audio_path = None # Path for TTS audio
+    generated_audio_path = None
+    temp_did_video_path = None
+    downloaded_overlay_image_path = None
+    uploaded_avatar_absolute_path = None # Keep track for cleanup
+
+    # Determine avatar source URL for D-ID
+    avatar_source_url = DEFAULT_AVATAR_URL
+    if uploaded_avatar_relative_path:
+        uploaded_avatar_absolute_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.basename(uploaded_avatar_relative_path))
+        if os.path.exists(uploaded_avatar_absolute_path):
+             avatar_source_url = url_for('uploaded_file', filename=os.path.basename(uploaded_avatar_relative_path), _external=True)
+             print(f"Using confirmed uploaded avatar URL: {avatar_source_url}")
+        else:
+             print(f"Warning: Uploaded avatar file not found at {uploaded_avatar_absolute_path}, using default.")
+             uploaded_avatar_absolute_path = None
 
     try:
-        # --- Scrape Product Data ---
-        print(f"Scraping product data from: {product_url}")
-        scraped_data = scrape_product_data(product_url)
-        if not scraped_data:
-            flash("Failed to scrape product data. Check URL or website structure.", "error")
-            raise Exception("Scraping failed")
-
-        product_image_urls = scraped_data.get('image_urls', [])
-        product_title = scraped_data.get('title', 'Product')
-        product_description = scraped_data.get('description', 'No description found.')
-        print(f"Scraped: Title='{product_title}', Desc length={len(product_description)}, Images Found={len(product_image_urls)}")
-
         # ===========================================
         # --- Branch Logic based on Video Type ---
         # ===========================================
+        error_message = None # Variable to hold potential errors
 
         if video_type == 'avatar':
-            # --- AVATAR VIDEO LOGIC (Mostly unchanged, but uses first scraped image for overlay) ---
-            print("--- Generating Avatar Video ---")
-            temp_did_video_path = None
-            downloaded_overlay_image_path = None # Specific path for overlay image
+            print("--- Generating Confirmed Avatar Video ---")
+            overlay_image_path_absolute = selected_absolute_paths[0] if selected_absolute_paths else None
+            downloaded_overlay_image_path = overlay_image_path_absolute
 
-            # --- 1a. Handle Avatar Upload (Only for Avatar Type) ---
-            if avatar_file and avatar_file.filename != '':
-                try:
-                    _, ext = os.path.splitext(avatar_file.filename)
-                    if ext.lower() not in ['.png', '.jpg', '.jpeg', '.webp']:
-                         flash("Invalid image file type for avatar. Please use PNG, JPG, JPEG, or WEBP.", "error")
-                         return redirect(url_for('index'))
-                    unique_filename = f"avatar_{uuid.uuid4()}{ext}"
-                    uploaded_image_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-                    avatar_file.save(uploaded_image_path)
-                    avatar_source_url = url_for('uploaded_file', filename=unique_filename, _external=True)
-                    print(f"Using uploaded avatar: {avatar_source_url}")
-                except Exception as e:
-                    flash(f"Error saving uploaded avatar file: {e}", "error")
-                    if uploaded_image_path and os.path.exists(uploaded_image_path): os.remove(uploaded_image_path)
-                    return redirect(url_for('index'))
-            else:
-                 print(f"Using default avatar: {DEFAULT_AVATAR_URL}")
-
-            # --- 3a. Generate Script (Only for Avatar Type) ---
             print("Generating marketing script...")
             script = generate_marketing_script(product_title, product_description)
-            if script.startswith("Error:"):
-                flash(f"Failed to generate script: {script}", "error")
-                raise Exception("Script generation failed")
-            print(f"Generated script: {script}")
+            if script.startswith("Error:"): error_message = f"Script generation failed: {script}"
 
-            # --- 4a. Generate Video with D-ID ---
-            print(f"Requesting video generation from D-ID with avatar: {avatar_source_url}")
-            d_id_result = create_d_id_talk(script, avatar_source_url)
-            if "error" in d_id_result:
-                 flash(f"Failed to generate video: {d_id_result['error']}", "error")
-                 raise Exception("D-ID video generation failed")
-            result_url = d_id_result.get("result_url")
-            print(f"D-ID video ready at: {result_url}")
+            if not error_message:
+                print(f"Requesting video generation from D-ID with avatar: {avatar_source_url}")
+                d_id_result = create_d_id_talk(script, avatar_source_url)
+                if "error" in d_id_result: error_message = f"D-ID video generation failed: {d_id_result['error']}"
+                else: result_url = d_id_result.get("result_url")
 
-            # --- 5a. Download D-ID Video ---
-            print("Downloading generated D-ID video...")
-            temp_video_filename = f"temp_{uuid.uuid4()}.mp4"
-            temp_did_video_path = os.path.join(app.config['GENERATED_FOLDER'], temp_video_filename)
-            if not download_video(result_url, temp_did_video_path):
-                flash("Failed to download the generated video from D-ID.", "error")
-                raise Exception("Video download failed")
-            print(f"D-ID video saved temporarily to: {temp_did_video_path}")
+            if not error_message:
+                print("Downloading generated D-ID video...")
+                temp_video_filename = f"temp_{uuid.uuid4()}.mp4"
+                temp_did_video_path = os.path.join(app.config['GENERATED_FOLDER'], temp_video_filename)
+                if not download_video(result_url, temp_did_video_path): error_message = "Video download failed"
 
-            # --- 6a. Download Product Image (if URL exists for overlay) ---
-            image_overlay_applied = False
-            if product_image_urls:
-                first_image_url = product_image_urls[0]
-                print(f"Downloading first product image for overlay: {first_image_url}")
-                img_ext = os.path.splitext(first_image_url)[1] or ".jpg"
-                img_filename = f"product_overlay_{uuid.uuid4()}{img_ext}"
-                downloaded_overlay_image_path = os.path.join(app.config['GENERATED_FOLDER'], img_filename)
-                if download_image(first_image_url, downloaded_overlay_image_path):
-                    print(f"Overlay image saved to: {downloaded_overlay_image_path}")
-                    image_overlay_applied = True
+            if not error_message:
+                final_video_filename = f"final_avatar_{uuid.uuid4()}.mp4"
+                final_video_path = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
+                if downloaded_overlay_image_path and os.path.exists(downloaded_overlay_image_path):
+                    print("Compositing D-ID video with selected product image overlay...")
+                    try:
+                        video_clip = VideoFileClip(temp_did_video_path)
+                        img_clip = ImageClip(downloaded_overlay_image_path).resize(width=video_clip.w * 0.25).set_position(('right','bottom')).set_duration(video_clip.duration)
+                        final_clip = CompositeVideoClip([video_clip, img_clip], size=video_clip.size)
+                        final_clip.write_videofile(final_video_path, codec='libx264', audio_codec='aac', temp_audiofile='temp-avatar-audio.m4a', remove_temp=True, preset='medium', ffmpeg_params=["-profile:v","baseline", "-level","3.0", "-pix_fmt", "yuv420p"])
+                        img_clip.close(); video_clip.close(); final_clip.close(); print("Overlay successful.")
+                    except Exception as e:
+                        print(f"Overlay failed: {e}")
+                        # Fallback: Use the D-ID video without overlay
+                        final_video_path = temp_did_video_path
+                        final_video_filename = temp_video_filename
                 else:
-                    print("Failed to download overlay image."); downloaded_overlay_image_path = None # Ensure path is None
-            else:
-                print("No product images found for overlay.")
-
-            # --- 7a. Composite D-ID Video with Image using MoviePy (if applicable) ---
-            final_video_filename = f"final_avatar_{uuid.uuid4()}.mp4"
-            final_video_path = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
-
-            if image_overlay_applied and downloaded_overlay_image_path:
-                # (Existing MoviePy overlay logic - slightly adapted variable names)
-                print("Compositing D-ID video with product image overlay...")
-                try:
-                    video_clip = VideoFileClip(temp_did_video_path)
-                    img_clip = ImageClip(downloaded_overlay_image_path).resize(width=video_clip.w * 0.25).set_position(('right','bottom')).set_duration(video_clip.duration)
-                    final_clip = CompositeVideoClip([video_clip, img_clip], size=video_clip.size)
-                    final_clip.write_videofile(final_video_path, codec='libx264', audio_codec='aac', temp_audiofile='temp-avatar-audio.m4a', remove_temp=True, preset='medium', ffmpeg_params=["-profile:v","baseline", "-level","3.0", "-pix_fmt", "yuv420p"])
-                    img_clip.close(); video_clip.close(); final_clip.close(); print("Overlay successful.")
-                except Exception as e: print(f"Overlay failed: {e}"); final_video_path = temp_did_video_path; final_video_filename = temp_video_filename # Fallback
-            else:
-                print("Skipping overlay compositing for avatar video.")
-                final_video_path = temp_did_video_path
-                final_video_filename = temp_video_filename
+                    print("No overlay image selected or found. Using D-ID video directly.")
+                    final_video_path = temp_did_video_path
+                    final_video_filename = temp_video_filename
 
         elif video_type == 'product':
-            # --- PRODUCT SLIDESHOW LOGIC ---
-            print("--- Generating Product Slideshow Video ---")
+            print("--- Generating Confirmed Product Slideshow Video ---")
+            if not selected_absolute_paths:
+                error_message = "No images were selected for the slideshow."
 
-            # 1b. Check for Product Images
-            if not product_image_urls:
-                flash("Could not find any product images on the provided page. Cannot generate slideshow.", "error")
-                raise Exception("Missing product images for slideshow.")
-            print(f"Found {len(product_image_urls)} images for slideshow.")
+            if not error_message:
+                print("Generating script for voiceover...")
+                script = generate_marketing_script(product_title, product_description)
+                if script.startswith("Error:"): error_message = f"Script generation failed: {script}"
 
-            # 2b. Download ALL Product Images
-            print("Downloading product images...")
-            for i, img_url in enumerate(product_image_urls):
-                img_ext = os.path.splitext(img_url)[1] or ".jpg"
-                img_filename = f"product_source_{i}_{uuid.uuid4()}{img_ext}"
-                img_path = os.path.join(app.config['GENERATED_FOLDER'], img_filename)
-                if download_image(img_url, img_path):
-                    downloaded_image_paths.append(img_path)
-                else:
-                    print(f"Warning: Failed to download image {i+1}: {img_url}")
-            if not downloaded_image_paths:
-                flash("Failed to download any valid product images.", "error")
-                raise Exception("Image downloads failed.")
-            print(f"Successfully downloaded {len(downloaded_image_paths)} images.")
+            if not error_message:
+                print("Generating voiceover...")
+                audio_filename = f"voiceover_{uuid.uuid4()}.mp3"
+                generated_audio_path = os.path.join(app.config['GENERATED_FOLDER'], audio_filename)
+                if not generate_voiceover(script, generated_audio_path): error_message = "TTS generation failed"
 
-            # 3b. Generate Script for Narration
-            print("Generating script for voiceover...")
-            script = generate_marketing_script(product_title, product_description)
-            if script.startswith("Error:"):
-                flash(f"Failed to generate script: {script}", "error")
-                raise Exception("Script generation failed")
-
-            # 4b. Generate Voiceover Audio
-            print("Generating voiceover...")
-            audio_filename = f"voiceover_{uuid.uuid4()}.mp3"
-            generated_audio_path = os.path.join(app.config['GENERATED_FOLDER'], audio_filename)
-            if not generate_voiceover(script, generated_audio_path):
-                flash("Failed to generate voiceover audio.", "error")
-                raise Exception("TTS generation failed")
-
-            # 5b. Generate Slideshow Video using Helper (Pass font path)
-            final_video_filename = f"final_slideshow_{uuid.uuid4()}.mp4"
-            final_video_path = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
-
-            if not generate_slideshow_video(downloaded_image_paths, generated_audio_path, final_video_path, app.config['FONT_PATH']):
-                flash("Failed to generate the final slideshow video.", "error")
-                raise Exception("Slideshow video generation failed.")
+            if not error_message:
+                final_video_filename = f"final_slideshow_{uuid.uuid4()}.mp4"
+                final_video_path = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
+                if not generate_slideshow_video(selected_absolute_paths, generated_audio_path, final_video_path, app.config['FONT_PATH']):
+                    error_message = "Slideshow video generation failed."
 
         else:
-            flash("Invalid video type selected.", "error")
-            raise Exception("Invalid video type")
+            error_message = "Invalid video type specified."
 
         # ===========================================
-        # --- Common Rendering Logic ---
+        # --- Return JSON Response ---
         # ===========================================
+        if error_message:
+             raise Exception(error_message) # Raise exception to be caught below
+
         if final_video_path and final_video_filename:
             video_url = url_for('static', filename=f'generated/{final_video_filename}')
-            print(f"Rendering result page with video: {video_url}")
-            return render_template('result.html', video_url=video_url)
+            print(f"Generation successful. Video URL: {video_url}")
+            # Clear session data only on success before returning
+            session.pop('confirm_data', None)
+            session.pop('confirm_images', None)
+            return jsonify({'success': True, 'video_url': video_url})
         else:
-            # This case should ideally not be reached if exceptions are raised correctly
-            flash("An unknown error occurred, failed to determine final video.", "error")
-            return redirect(url_for('index'))
+            # This case should ideally not be reached if error handling above is correct
+            raise Exception("An unknown error occurred, failed to determine final video.")
 
     except Exception as e:
-        print(f"Error during generation process: {e}")
-        if "OPENAI_API_KEY" in str(e) or "authentication" in str(e).lower() or "Incorrect API key" in str(e):
-             flash("OpenAI API Key error. Please check your .env file and ensure the key is valid and has funds/credits.", "error")
-        elif "quota" in str(e).lower():
-             flash("OpenAI API request failed: You might have exceeded your usage quota.", "error")
-        # Keep the general flash message setting within specific failure points if possible
-        return redirect(url_for('index'))
+        error_msg = f"An error occurred during video generation: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc() # Print full traceback to server logs
+        # Return JSON error
+        return jsonify({'success': False, 'error': error_msg}), 500
 
     finally:
-        # --- Cleanup ---
-        # Delete uploaded avatar (if any)
-        if uploaded_image_path and os.path.exists(uploaded_image_path):
-            try: os.remove(uploaded_image_path); print(f"Cleaned up uploaded avatar: {uploaded_image_path}")
-            except Exception as e: print(f"Error cleaning up avatar {uploaded_image_path}: {e}")
+        # --- Cleanup (runs even if errors occurred) ---
+        print("Cleaning up temporary files...")
+        if uploaded_avatar_absolute_path and os.path.exists(uploaded_avatar_absolute_path):
+            try: os.remove(uploaded_avatar_absolute_path); print(f"Cleaned up uploaded avatar: {uploaded_avatar_absolute_path}")
+            except Exception as e: print(f"Error cleaning up avatar {uploaded_avatar_absolute_path}: {e}")
 
-        # Delete downloaded product images (overlay or slideshow sources)
-        # Includes overlay image from avatar path now
-        if 'downloaded_overlay_image_path' in locals() and downloaded_overlay_image_path and os.path.exists(downloaded_overlay_image_path):
-             try: os.remove(downloaded_overlay_image_path); print(f"Cleaned up: {downloaded_overlay_image_path}")
-             except Exception as e: print(f"Error cleaning up {downloaded_overlay_image_path}: {e}")
-        for img_path in downloaded_image_paths: # For slideshow images
-            if os.path.exists(img_path):
-                try: os.remove(img_path); print(f"Cleaned up: {img_path}")
-                except Exception as e: print(f"Error cleaning up {img_path}: {e}")
+        confirm_images_to_delete = session.get('confirm_images', []) # Get paths again in case session wasn't cleared on error
+        for img_info in confirm_images_to_delete:
+            abs_path = img_info.get('absolute_path')
+            if abs_path and os.path.exists(abs_path):
+                try: os.remove(abs_path); print(f"Cleaned up confirmation image: {abs_path}")
+                except Exception as e: print(f"Error cleaning up confirmation image {abs_path}: {e}")
 
-        # Delete temporary D-ID video (if avatar flow and compositing happened)
-        if 'temp_did_video_path' in locals() and temp_did_video_path and final_video_path != temp_did_video_path and os.path.exists(temp_did_video_path):
-             try: os.remove(temp_did_video_path); print(f"Cleaned up: {temp_did_video_path}")
-             except Exception as e: print(f"Error cleaning up {temp_did_video_path}: {e}")
+        if temp_did_video_path and os.path.exists(temp_did_video_path):
+             if final_video_path != temp_did_video_path:
+                 try: os.remove(temp_did_video_path); print(f"Cleaned up temp D-ID video: {temp_did_video_path}")
+                 except Exception as e: print(f"Error cleaning up temp D-ID video {temp_did_video_path}: {e}")
+             else:
+                 print(f"Skipping cleanup of temp D-ID video as it's the final video: {temp_did_video_path}")
 
-        # Delete generated voiceover audio file
         if generated_audio_path and os.path.exists(generated_audio_path):
-            try: os.remove(generated_audio_path); print(f"Cleaned up: {generated_audio_path}")
-            except Exception as e: print(f"Error cleaning up {generated_audio_path}: {e}")
+            try: os.remove(generated_audio_path); print(f"Cleaned up voiceover audio: {generated_audio_path}")
+            except Exception as e: print(f"Error cleaning up voiceover audio {generated_audio_path}: {e}")
 
+        # Attempt to clear session data again in finally block, just in case
+        session.pop('confirm_data', None)
+        session.pop('confirm_images', None)
 
-# Route to serve uploaded files
+# Route to serve uploaded files (needed for avatar URL)
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
     """Serves uploaded files statically."""
+    # Ensure filename is safe (though UUIDs are generally safe)
+    # from werkzeug.utils import secure_filename
+    # filename = secure_filename(filename)
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 
 if __name__ == '__main__':
+    # Make sure debug is False in production
     app.run(debug=True, host='0.0.0.0', port=5000) 
