@@ -434,10 +434,10 @@ def get_word_timestamps(audio_path):
         print(f"Error calling OpenAI Whisper API for timestamps: {e}")
         return None
 
-# --- MODIFIED Helper: Generate Slideshow Video with Cropped Images ---
+# --- MODIFIED Helper: Generate Slideshow Video with Padded Images ---
 def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
-    """Generates slideshow with images cropped to fit frame, adaptive frame size, and rounded captions."""
-    print("Starting slideshow video generation with images cropped to fit frame...")
+    """Generates slideshow with images resized to fit frame (padded), adaptive frame size, and rounded captions."""
+    print("Starting slideshow video generation with images padded to fit frame...")
 
     # Frame dimensions (will be adjusted based on images)
     DEFAULT_W, DEFAULT_H = 1920, 1080  # 16:9 default
@@ -446,6 +446,7 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
 
     output_fps = 30
     fade_duration = 0.5 # Duration for fade between images
+    padding_color = (0, 0, 0) # Black padding (R, G, B)
 
     # Caption settings (adjust as needed)
     caption_font_size = 55
@@ -509,8 +510,8 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         base_image_duration = total_duration / num_images
         print(f"Total duration: {total_duration:.2f}s, Num images: {num_images}, Base duration/image: {base_image_duration:.2f}s")
 
-        # 4. Create Image Clips with Crop-to-Fit
-        print(f"Processing {num_images} images for slideshow frame {W}x{H}...")
+        # 4. Create Image Clips with Fit-Inside (Padding)
+        print(f"Processing {num_images} images for slideshow frame {W}x{H} with padding...")
         current_time = 0
         for i, img_path in enumerate(valid_image_paths):
             start_time = current_time
@@ -525,34 +526,38 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
                     img_w, img_h = img.size
                     img_aspect = img_w / img_h
 
-                    # --- CROP-TO-FIT LOGIC ---
+                    # --- FIT-INSIDE (PADDING) LOGIC ---
+                    final_img_pil = None # Variable to hold the final PIL image for the frame
+
                     if abs(img_aspect - target_aspect) < 0.01: # If aspect ratios are very close, just resize
                         print("  Aspect ratio matches frame. Resizing...")
-                        resized_img = img.resize((W, H), image_resampling_quality)
-                    elif img_aspect > target_aspect: # Image is wider than frame: Resize based on height, crop width
-                        print("  Image wider than frame. Resizing height and cropping width...")
-                        new_height = H
-                        new_width = int(new_height * img_aspect)
-                        resized_img = img.resize((new_width, new_height), image_resampling_quality)
-                        # Calculate horizontal crop
-                        crop_amount = new_width - W
-                        left = crop_amount // 2
-                        right = left + W
-                        resized_img = resized_img.crop((left, 0, right, new_height))
-                    else: # Image is taller than frame: Resize based on width, crop height
-                        print("  Image taller than frame. Resizing width and cropping height...")
-                        new_width = W
-                        new_height = int(new_width / img_aspect)
-                        resized_img = img.resize((new_width, new_height), image_resampling_quality)
-                        # Calculate vertical crop
-                        crop_amount = new_height - H
-                        top = crop_amount // 2
-                        bottom = top + H
-                        resized_img = resized_img.crop((0, top, new_width, bottom))
-                    # --- END CROP-TO-FIT ---
+                        final_img_pil = img.resize((W, H), image_resampling_quality)
+                    else:
+                        # Create the background canvas
+                        background = Image.new('RGB', (W, H), padding_color)
 
-                    # Convert PIL image to numpy array for MoviePy
-                    img_array = np.array(resized_img)
+                        if img_aspect > target_aspect: # Image is wider than frame: Fit width, pad top/bottom
+                            print("  Image wider than frame. Resizing width and padding height...")
+                            new_width = W
+                            new_height = int(new_width / img_aspect)
+                            resized_img = img.resize((new_width, new_height), image_resampling_quality)
+                            # Calculate vertical paste position
+                            paste_y = (H - new_height) // 2
+                            background.paste(resized_img, (0, paste_y))
+                            final_img_pil = background
+                        else: # Image is taller than frame: Fit height, pad left/right
+                            print("  Image taller than frame. Resizing height and padding width...")
+                            new_height = H
+                            new_width = int(new_height * img_aspect)
+                            resized_img = img.resize((new_width, new_height), image_resampling_quality)
+                            # Calculate horizontal paste position
+                            paste_x = (W - new_width) // 2
+                            background.paste(resized_img, (paste_x, 0))
+                            final_img_pil = background
+                    # --- END FIT-INSIDE ---
+
+                    # Convert final PIL image (with padding if needed) to numpy array for MoviePy
+                    img_array = np.array(final_img_pil)
 
                     # Create ImageClip
                     img_clip = ImageClip(img_array).set_duration(duration).set_start(start_time)
@@ -566,10 +571,7 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
 
             except Exception as e:
                 print(f"Error processing image {img_path}: {e}. Skipping.")
-                # Adjust duration distribution if an image fails? Maybe not necessary for simple cases.
-                # If skipping, we need to adjust total_duration or redistribute time,
-                # but for simplicity, we'll let the timeline have a gap or end early.
-                # A better approach would recalculate durations.
+                # Handle skipped images (optional: redistribute time or accept gaps)
 
             current_time = end_time # Move to the start time for the next clip
 
@@ -582,27 +584,21 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         # Ensure final duration matches audio
         video_sequence = video_sequence.set_duration(total_duration)
 
-        # 6. Create Caption Clips (MODIFIED ACCESS METHOD)
+        # 6. Create Caption Clips (existing logic using dot notation)
         if word_timestamps:
             print("Generating caption clips...")
             font_param = font_path # Use the provided font path directly
             if not os.path.exists(font_param):
                 print(f"Warning: Font file not found at {font_param}. MoviePy might use a default.")
-                # On some systems, you might need to provide a system font name like "Arial-Bold"
-                # font_param = "Arial-Bold" # Example fallback
 
             current_caption_start = 0
             segment_words = []
             segment_start_time = 0
 
-            # --- MODIFICATION START ---
-            # Iterate through word_timestamps using dot notation
             for i, word_info in enumerate(word_timestamps):
-                # Access attributes using dot notation
                 word = word_info.word
                 start = word_info.start
                 end = word_info.end
-            # --- MODIFICATION END ---
 
                 if not segment_words: # Start of a new segment
                     segment_start_time = start
@@ -611,75 +607,53 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
                 current_duration = end - segment_start_time
                 is_last_word = (i == len(word_timestamps) - 1)
 
-                # Check if segment should end
                 if len(segment_words) >= caption_max_words_per_segment or \
                    current_duration >= caption_max_duration_per_segment or \
                    is_last_word:
 
                     text = " ".join(segment_words)
-                    # Use the 'end' time from the current word_info object
                     duration = end - segment_start_time
                     start_time = segment_start_time
 
                     print(f"  Caption: '{text}' | Start: {start_time:.2f} | Duration: {duration:.2f}")
 
-                    # --- Create Rounded Background ---
-                    # Estimate text size first (might need adjustment)
                     try:
-                        # Use TextClip to estimate size first (a bit inefficient but often necessary)
                         temp_text_clip = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, method='label')
                         txt_w, txt_h = temp_text_clip.size
-                        temp_text_clip.close() # Close the temporary clip
+                        temp_text_clip.close()
 
                         bg_w = txt_w + 2 * caption_padding
                         bg_h = txt_h + 2 * caption_padding
 
-                        # Create background image with Pillow
-                        bg_image = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0)) # Transparent background
+                        bg_image = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0))
                         draw = ImageDraw.Draw(bg_image)
-                        # Draw rounded rectangle (black with some transparency maybe?)
-                        # Use solid black for now as requested
-                        draw.rounded_rectangle(
-                            (0, 0, bg_w, bg_h),
-                            radius=caption_corner_radius,
-                            fill=caption_bg_color # Use solid black
-                        )
-                        # Convert Pillow image to MoviePy clip
+                        draw.rounded_rectangle((0, 0, bg_w, bg_h), radius=caption_corner_radius, fill=caption_bg_color)
                         bg_clip = ImageClip(np.array(bg_image), ismask=False, transparent=True).set_opacity(1.0)
+
                     except Exception as pil_err:
                         print(f"Warning: Failed to create rounded background image: {pil_err}. Using simple TextClip.")
-                        # Fallback to simple TextClip with background
-                        y_pos = H - caption_bottom_margin - 50 # Estimate height
+                        y_pos = H - caption_bottom_margin - 50
                         txt_clip = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, bg_color=caption_bg_color, method='caption', align='center', size=(W*0.8, None))
-                        # Use the 'start' and 'duration' calculated above
                         txt_clip = txt_clip.set_position(('center', y_pos)).set_start(start_time).set_duration(duration)
                         text_clips_list.append(txt_clip)
-                        # Reset segment and continue
                         segment_words = []
-                        continue # Skip the rest of the loop for this segment
+                        continue
 
-                    # --- Create Final Text Clip ---
                     text_clip_final = TextClip(text, fontsize=caption_font_size, color=caption_color, font=font_param, method='label', align='center')
 
-                    # --- Composite Text onto Rounded Background ---
                     caption_clip = CompositeVideoClip([
                         bg_clip.set_position('center'),
                         text_clip_final.set_position('center')
                     ], size=(bg_w, bg_h))
 
-                    # Set timing and position for the composite caption
-                    y_pos = H - caption_bottom_margin - caption_clip.h # Position based on composite height
+                    y_pos = H - caption_bottom_margin - caption_clip.h
                     caption_clip = caption_clip.set_position(('center', y_pos))
-                    # Use the 'start' and 'duration' calculated above
                     caption_clip = caption_clip.set_start(start_time).set_duration(duration)
 
                     text_clips_list.append(caption_clip)
 
-                    # Close intermediate clips
                     bg_clip.close()
                     text_clip_final.close()
-
-                    # Reset for next segment
                     segment_words = []
 
             print(f"Created {len(text_clips_list)} composite caption clips.")
@@ -693,7 +667,7 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         final_video_sequence = CompositeVideoClip(final_composite_elements, size=(W, H))
         final_video_sequence = final_video_sequence.set_duration(total_duration).set_audio(audio_clip)
 
-        # 8. Add Overall Fade In/Out (Optional, applied to the whole sequence)
+        # 8. Add Overall Fade In/Out (Optional)
         # final_video_sequence = final_video_sequence.fadein(fade_duration).fadeout(fade_duration)
 
         # 9. Write Video File
