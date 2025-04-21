@@ -1052,30 +1052,37 @@ def create_video_route():
 
     if not confirm_data:
         print("Error: Session data missing.")
-        # Return JSON error
         return jsonify({'success': False, 'error': 'Session expired or data missing. Please start over.'}), 400
 
-    # --- Retrieve selected images from the POST request body (sent as JSON) ---
+    # --- Retrieve selected images AND EDITED description from the POST request body (sent as JSON) ---
     try:
         request_data = request.get_json()
         if not request_data:
             raise ValueError("Missing JSON data in request")
         selected_relative_paths = request_data.get('selected_images', [])
+        # *** Get the edited description from the JSON payload ***
+        edited_product_description = request_data.get('product_description', None) # Get edited description
         if not isinstance(selected_relative_paths, list):
              raise ValueError("selected_images should be a list")
+        if edited_product_description is None: # Check if description was sent
+             print("Warning: Edited product description not found in request JSON. Using original from session.")
     except Exception as e:
         print(f"Error parsing request JSON: {e}")
         return jsonify({'success': False, 'error': f'Invalid request format: {e}'}), 400
 
 
-    # --- Get data stored in session ---
+    # --- Get data stored in session (as fallback or for other fields) ---
     product_title = confirm_data.get('product_title', 'Product')
-    product_description = confirm_data.get('product_description', '')
+    # *** Use the EDITED description if provided, otherwise fallback to session ***
+    product_description = edited_product_description if edited_product_description is not None else confirm_data.get('product_description', '')
     video_type = confirm_data.get('video_type', 'product')
     uploaded_avatar_relative_path = confirm_data.get('uploaded_avatar_relative_path')
 
+    # *** Log which description is being used ***
     print(f"Retrieved from session: Title='{product_title}', VideoType='{video_type}', Avatar='{uploaded_avatar_relative_path}'")
     print(f"Selected image relative paths from JSON request: {selected_relative_paths}")
+    print(f"Using Product Description for generation: {'(Edited from Request)' if edited_product_description is not None else '(Original from Session)'}")
+    # print(f"Description content: {product_description[:100]}...") # Optional: log start of description
 
     # --- Map selected relative paths back to absolute paths ---
     selected_absolute_paths = []
@@ -1095,7 +1102,7 @@ def create_video_route():
     generated_audio_path = None
     temp_did_video_path = None
     downloaded_overlay_image_path = None
-    uploaded_avatar_absolute_path = None # Keep track for cleanup
+    uploaded_avatar_absolute_path = None
 
     # Determine avatar source URL for D-ID
     avatar_source_url = DEFAULT_AVATAR_URL
@@ -1120,6 +1127,7 @@ def create_video_route():
             downloaded_overlay_image_path = overlay_image_path_absolute
 
             print("Generating marketing script...")
+            # Uses the potentially edited description
             script = generate_marketing_script(product_title, product_description)
             if script.startswith("Error:"): error_message = f"Script generation failed: {script}"
 
@@ -1163,6 +1171,7 @@ def create_video_route():
 
             if not error_message:
                 print("Generating script for voiceover...")
+                 # Uses the potentially edited description
                 script = generate_marketing_script(product_title, product_description)
                 if script.startswith("Error:"): error_message = f"Script generation failed: {script}"
 

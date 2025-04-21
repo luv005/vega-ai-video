@@ -101,6 +101,10 @@
         #errorMessage {
             display: none; /* Hidden by default */
         }
+        textarea.form-control {
+            min-height: 150px; /* Give textarea a decent height */
+            resize: vertical; /* Allow vertical resizing */
+        }
     </style>
 </head>
 <body>
@@ -134,9 +138,9 @@
             </div>
 
             <div class="mb-3">
-                <label class="form-label"><strong>Product Description:</strong></label>
-                <div class="description-box">
-                    <p>{{ product_description }}</p>
+                <label class="form-label"><strong>Product Description (Editable):</strong></label>
+                <div class="mb-3">
+                    <textarea id="product-description" name="product_description" class="form-control" rows="6">{{ product_description }}</textarea>
                 </div>
             </div>
 
@@ -156,6 +160,9 @@
                     <p class="text-muted">No product images were found or downloaded.</p>
                 {% endif %}
             </div>
+
+            <!-- Hidden input to carry video type -->
+            <input type="hidden" name="video_type" value="{{ video_type }}">
 
             <!-- Buttons Area -->
             <div id="buttonsArea" class="d-grid gap-2 d-md-flex justify-content-md-end">
@@ -191,6 +198,8 @@
         const errorMessageDiv = document.getElementById('errorMessage');
         const errorMessageText = document.getElementById('errorMessageText');
         const confirmButton = document.getElementById('confirmButton');
+        // *** Get the description textarea ***
+        const descriptionTextarea = document.getElementById('product-description');
 
         form.addEventListener('submit', async function(event) {
             event.preventDefault(); // Prevent default form submission
@@ -211,6 +220,9 @@
                 selectedImages.push(checkbox.value);
             });
 
+            // *** Get the EDITED description from the textarea ***
+            const editedDescription = descriptionTextarea.value;
+
             console.log('Selected images for submission:', selectedImages);
 
             try {
@@ -221,7 +233,10 @@
                         'Accept': 'application/json'
                         // Add CSRF token header if you implement CSRF protection
                     },
-                    body: JSON.stringify({ selected_images: selectedImages })
+                    body: JSON.stringify({
+                        selected_images: selectedImages,
+                        product_description: editedDescription
+                    })
                 });
 
                 // Hide loading indicator regardless of outcome
@@ -242,6 +257,13 @@
                     successMsg.className = 'text-success mt-2';
                     successMsg.textContent = 'Video generated successfully!';
                     videoResultDiv.appendChild(successMsg);
+                    // Optionally add a download button
+                    const downloadBtn = document.createElement('a');
+                    downloadBtn.href = result.video_url;
+                    downloadBtn.textContent = 'Download Video';
+                    downloadBtn.className = 'btn btn-success mt-2';
+                    downloadBtn.download = ''; // Suggests browser should download
+                    videoResultDiv.appendChild(downloadBtn);
 
                 } else {
                     // Error occurred
