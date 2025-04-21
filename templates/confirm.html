@@ -144,11 +144,10 @@
                 <label class="form-label"><strong>Select Images to Use:</strong></label>
                 {% if confirm_images %}
                     <div class="image-grid">
-                        {% for img_relative_path in confirm_images %}
+                        {% for image_path in confirm_images %}
                         <div class="image-item">
-                            <img src="{{ url_for('static', filename=img_relative_path) }}" alt="Product Image {{ loop.index }}">
-                            <!-- Ensure checkboxes have the name 'selected_images' -->
-                            <input type="checkbox" name="selected_images" value="{{ img_relative_path }}" checked>
+                            <img src="{{ image_path }}" alt="Product Image {{ loop.index }}" class="confirm-image">
+                            <input type="checkbox" name="selected_images" value="{{ image_path }}" checked>
                         </div>
                         {% endfor %}
                     </div>

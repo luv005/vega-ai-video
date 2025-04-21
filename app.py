@@ -17,6 +17,15 @@ import numpy as np
 import math # For ceiling function
 import platform # Import platform module
 import shutil # For potential temporary directory cleanup
+import json
+import re
+import hashlib # Import hashlib for hashing image content
+import io # Import io for handling image bytes with PIL
+from urllib.parse import urlparse # To help get extension from URL
+import imagehash # <-- Import imagehash
+
+# --- NEW: Import Playwright ---
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 # --- Configuration ---
 # load_dotenv()  # Load environment variables from .env file
@@ -51,6 +60,7 @@ app.config['CONFIRM_FOLDER'] = os.path.join(app.config['GENERATED_FOLDER'], 'con
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Max upload size 16MB
 app.config['FONT_PATH'] = 'fonts/Poppins-Bold.ttf' # CHANGE TO YOUR POPPINS BOLD FILENAME
 MAX_PRODUCT_IMAGES = 8 # Limit the number of images to process
+PHASH_THRESHOLD = 5 # Define the perceptual hash threshold (lower = stricter)
 
 # Ensure upload and generated directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -100,104 +110,211 @@ if not D_ID_API_KEY:
 
 # --- Helper Functions ---
 
+# --- REVISED Scrape Function (Clean URLs Before Adding) ---
 def scrape_product_data(url):
-    """Scrapes product title, description, and MULTIPLE image URLs from a URL."""
-    print(f"Attempting to scrape: {url}")
+    """Scrapes product data using Playwright, cleaning URLs to get high-res."""
+    print(f"Attempting to scrape with Playwright: {url}")
+    product_data = {'title': 'Product', 'description': 'No description found.', 'image_urls': []}
+    html_content = None
+
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        }
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+        with sync_playwright() as p:
+            browser = None
+            try:
+                browser = p.chromium.launch(headless=True) # Consider headless=False for debugging blocks
+                print("  Playwright browser launched.")
+            except Exception as launch_err:
+                 print(f"Error launching Playwright browser: {launch_err}")
+                 return {'error': 'Failed to launch browser. Run `playwright install`.'}
 
-        # --- Title Extraction ---
-        title = None
-        title_selectors = ['#productTitle', 'h1.product-title', 'h1[itemprop="name"]', 'h1']
-        for selector in title_selectors:
-            el = soup.select_one(selector)
-            if el: title = el.get_text(strip=True); break
-        if not title: title_tag = soup.find('title'); title = title_tag.get_text(strip=True) if title_tag else "Product"
+            # Use a realistic user agent
+            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+            viewport = {'width': 1920, 'height': 1080}
+            context = browser.new_context(user_agent=user_agent, viewport=viewport, java_script_enabled=True, ignore_https_errors=True)
+            page = context.new_page()
+            print(f"  Navigating to {url}...")
 
-        # --- Description Extraction ---
-        description = None
-        desc_selectors = ['#feature-bullets .a-list-item', '#productDescription', 'meta[name="description"]', '.product-description']
-        desc_parts = []
-        # Try feature bullets first
-        bullet_elements = soup.select('#feature-bullets .a-list-item')
-        if bullet_elements:
-            for item in bullet_elements: desc_parts.append(item.get_text(strip=True))
-            description = ". ".join(filter(None, desc_parts)) + "."
-        else: # Try other selectors
-            for selector in desc_selectors[1:]:
-                el = soup.select_one(selector)
-                if el:
-                    if el.name == 'meta': description = el.get('content', '').strip()
-                    else: description = el.get_text(strip=True)
-                    if description: break
-        if description: description = ' '.join(description.split())
-        else: description = "No description found."
+            try:
+                # Go to the page
+                page.goto(url, wait_until='domcontentloaded', timeout=60000) # Wait for initial structure
 
-        # --- MULTI-Image URL Extraction ---
-        image_urls = []
-        seen_urls = set()
+                # --- *** ADD CAPTCHA/BLOCK DETECTION *** ---
+                page_title = page.title().lower()
+                page_content_lower = page.content().lower() # Get page content for text checks
+                captcha_selectors = ['#captchacharacters', 'input[name="field-keywords"][type="hidden"]'] # Selectors indicating CAPTCHA form
+                captcha_texts = ['server busy', 'type the characters you see', 'enter the characters', 'robot check'] # Text indicators
 
-        # Prioritize common main/large image selectors first
-        main_image_selectors = [
-            '#landingImage', '#imgBlkFront', '#main-image-container img',
-            '.product-image-gallery img', 'meta[property="og:image"]'
-        ]
-        for selector in main_image_selectors:
-            elements = soup.select(selector)
-            for img_element in elements:
-                src = img_element.get('content') if img_element.name == 'meta' else img_element.get('src')
-                if src and src.startswith('http') and src not in seen_urls:
-                    # Basic check to avoid tiny icons/spacers if possible
-                    if 'base64' not in src and 'spacer' not in src.lower() and 'icon' not in src.lower():
-                         # Attempt to get higher resolution version (common Amazon pattern)
-                         src = src.replace('_AC_US40_', '_AC_SL1500_').replace('_SX342_', '_SL1500_').replace('_SX466_', '_SL1500_')
-                         image_urls.append(src)
-                         seen_urls.add(src)
-                         if len(image_urls) >= MAX_PRODUCT_IMAGES: break
-            if len(image_urls) >= MAX_PRODUCT_IMAGES: break
+                is_blocked = False
+                if "captcha" in page_title or any(text in page_title for text in captcha_texts):
+                    is_blocked = True
+                    print("  Block detected via page title.")
+                else:
+                    for selector in captcha_selectors:
+                        if page.query_selector(selector):
+                            is_blocked = True
+                            print(f"  Block detected via selector: {selector}")
+                            break
+                    if not is_blocked:
+                         for text in captcha_texts:
+                              if text in page_content_lower:
+                                   is_blocked = True
+                                   print(f"  Block detected via text content: '{text}'")
+                                   break
 
-        # Then look for thumbnails (often in lists or specific divs)
-        if len(image_urls) < MAX_PRODUCT_IMAGES:
-            thumb_selectors = [
-                '#altImages img', '.imageThumbnail img', '.product-thumbnails img',
-                'li.thumb img', 'div[data-thumbnail-url] img'
-            ]
-            for selector in thumb_selectors:
-                elements = soup.select(selector)
-                for img_element in elements:
-                    src = img_element.get('src')
-                    if src and src.startswith('http') and src not in seen_urls:
-                         if 'base64' not in src and 'spacer' not in src.lower() and 'icon' not in src.lower():
-                            # Attempt to get higher resolution version
-                            src = src.replace('_AC_US40_', '_AC_SL1500_').replace('_SX342_', '_SL1500_').replace('_SX466_', '_SL1500_')
-                            image_urls.append(src)
-                            seen_urls.add(src)
-                            if len(image_urls) >= MAX_PRODUCT_IMAGES: break
-                if len(image_urls) >= MAX_PRODUCT_IMAGES: break
+                if is_blocked:
+                    print(f"Error: Playwright encountered a CAPTCHA or block page for URL: {url}")
+                    # Optionally take a screenshot for debugging
+                    # screenshot_path = f"captcha_screenshot_{uuid.uuid4().hex[:6]}.png"
+                    # page.screenshot(path=screenshot_path)
+                    # print(f"  Screenshot saved to: {screenshot_path}")
+                    raise PlaywrightError("Scraping blocked (CAPTCHA/Block page detected).")
+                # --- *** END BLOCK DETECTION *** ---
 
-        print(f"Scraped Title: {title}")
-        print(f"Scraped Description Length: {len(description)}")
-        print(f"Found {len(image_urls)} product images.")
+                # If not blocked, wait for dynamic content to potentially load
+                print("  No block detected, waiting for network idle...")
+                page.wait_for_load_state('networkidle', timeout=30000) # Wait for network activity to settle
 
-        return {
-            "title": title,
-            "description": description,
-            "image_urls": image_urls # Return a list of URLs
-        }
+                # Wait for essential elements (main image OR thumbnails)
+                print("  Waiting for main image OR thumbnail container...")
+                page.wait_for_selector('#imgTagWrapperId, #landingImage, #imgBlkFront, #altImages', timeout=20000)
+                print("  Essential elements appear loaded.")
+                html_content = page.content()
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error scraping URL {url}: {e}")
-        return None
+            except PlaywrightTimeoutError as e:
+                print(f"  Timeout during Playwright navigation/waiting: {e}")
+                # Try getting content anyway, might be partial or the block page
+                html_content = page.content()
+                if not html_content: return {'error': 'Playwright timed out loading page content.'}
+                # Re-check for blocks if timeout occurred
+                if any(text in html_content.lower() for text in captcha_texts):
+                     print("  Block detected in content after timeout.")
+                     raise PlaywrightError("Scraping blocked (CAPTCHA/Block page detected after timeout).")
+                print("  Proceeding with potentially partial content after timeout.")
+            except PlaywrightError as e: # Catch errors raised explicitly (like our block detection)
+                 print(f"  Playwright operation error: {e}")
+                 raise # Re-raise to be caught by the outer try/except
+            except Exception as nav_err:
+                 print(f"  Error during Playwright navigation/interaction: {nav_err}")
+                 raise PlaywrightError(f'Error during browser navigation: {nav_err}') # Wrap as PlaywrightError
+            finally:
+                 if 'context' in locals() and context: context.close()
+                 if browser: browser.close()
+                 print("  Playwright browser closed.")
+
+        # --- Process the HTML obtained from Playwright ---
+        if html_content:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            # --- Extract Title ---
+            title_tag = soup.select_one('#productTitle')
+            title = title_tag.get_text(strip=True) if title_tag else 'Product Title Not Found'
+            product_data['title'] = title
+            print(f"  Extracted Title: {title}")
+
+            # --- Extract Description ---
+            desc_tag = soup.select_one('#feature-bullets')
+            description = desc_tag.get_text(separator='\n', strip=True) if desc_tag else 'No description found.'
+            product_data['description'] = description
+            # print(f"  Extracted Description: {description[:100]}...") # Optional: log description start
+
+            # --- Extract HIGH-RES Images (CLEAN URLs) ---
+            image_urls = set()
+
+            # Method 1: data-a-dynamic-image (Primary source - CLEAN URLs)
+            main_image_tag = soup.select_one('#imgTagWrapperId img, #landingImage, #imgBlkFront')
+            if main_image_tag:
+                print("  Looking for 'data-a-dynamic-image'...")
+                dynamic_image_data = main_image_tag.get('data-a-dynamic-image')
+                if dynamic_image_data and isinstance(dynamic_image_data, str):
+                    try:
+                        image_map = json.loads(dynamic_image_data)
+                        print(f"  Found {len(image_map)} URLs in data-a-dynamic-image.")
+                        for img_url in image_map.keys():
+                             print(f"    Raw URL from dynamic data: {img_url}")
+                             if isinstance(img_url, str) and img_url.startswith('http'):
+                                 # *** CLEAN THE URL ***
+                                 cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', img_url)
+                                 print(f"    Cleaned URL: {cleaned_url}")
+                                 # Ensure it still looks like an image URL after cleaning
+                                 if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                     image_urls.add(cleaned_url) # Add the cleaned URL
+                                 else:
+                                     print(f"    Skipping cleaned URL (invalid extension?): {cleaned_url}")
+                    except json.JSONDecodeError:
+                        print("  Warning: Failed to parse data-a-dynamic-image JSON.")
+                        # Fallback to src if dynamic data fails parsing (CLEAN URL)
+                        src = main_image_tag.get('src')
+                        if src and src.startswith('http'):
+                             print(f"    Raw fallback src: {src}")
+                             cleaned_url = re.sub(r'\._.*?_\.', '.', src) # Use simpler regex for basic src fallback
+                             print(f"    Cleaned fallback src: {cleaned_url}")
+                             if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                 image_urls.add(cleaned_url)
+                # Fallback to src if dynamic data attribute is missing (CLEAN URL)
+                elif main_image_tag.get('src'):
+                     src = main_image_tag.get('src')
+                     print("  'data-a-dynamic-image' not found. Using 'src' attribute.")
+                     if src.startswith('http'):
+                         print(f"    Raw fallback src: {src}")
+                         cleaned_url = re.sub(r'\._.*?_\.', '.', src)
+                         print(f"    Cleaned fallback src: {cleaned_url}")
+                         if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                             image_urls.add(cleaned_url)
+            else:
+                 print("  Warning: Could not find main image tag.")
+
+            # Method 2: Thumbnail Scraping (#altImages - CLEAN URLs)
+            print("  Looking for thumbnails in #altImages...")
+            thumbnail_container = soup.select_one('#altImages')
+            if thumbnail_container:
+                thumb_elements = thumbnail_container.select('li.item img')
+                print(f"  Found {len(thumb_elements)} potential thumbnail img elements in #altImages.")
+                for thumb in thumb_elements:
+                    thumb_src = thumb.get('src')
+                    print(f"    Raw thumbnail src: {thumb_src}")
+                    if thumb_src and thumb_src.startswith('http') and 'loading-' not in thumb_src and 'spinner' not in thumb_src and 'pixel.gif' not in thumb_src:
+                        # *** CLEAN THE URL ***
+                        cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', thumb_src)
+                        print(f"    Cleaned thumbnail URL: {cleaned_url}")
+                        # Ensure it still looks like an image URL after cleaning
+                        if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                            image_urls.add(cleaned_url) # Add the cleaned URL
+                        else:
+                            print(f"    Skipping cleaned thumbnail URL (invalid extension?): {cleaned_url}")
+            else:
+                 print("  Thumbnail container #altImages not found.")
+
+            # Finalize list
+            product_data['image_urls'] = list(image_urls)
+
+            # --- Logging ---
+            print("-" * 30); print(f"DEBUG: Found {len(product_data['image_urls'])} unique CLEANED URLs after scraping:")
+            if product_data['image_urls']:
+                for i, img_url in enumerate(product_data['image_urls']): print(f"  URL {i+1}: {img_url}")
+            else: print("  No image URLs found.")
+            print("-" * 30)
+            print(f"Scraped Title via Playwright: {product_data['title']}")
+            print(f"Found {len(product_data['image_urls'])} unique image URLs via Playwright.")
+        else:
+             # This case might happen if Playwright failed very early
+             print("Error: No HTML content was retrieved by Playwright.")
+             return {'error': 'Playwright failed to retrieve page content.'}
+
+    except PlaywrightError as e: # Catch errors from Playwright steps or explicit raises
+        print(f"Playwright scraping failed: {e}")
+        return {'error': f'{e}'} # Return the specific error message
     except Exception as e:
-        print(f"Error parsing HTML from {url}: {e}")
-        return None
+        print(f"An unexpected error occurred during Playwright scraping: {e}")
+        import traceback
+        traceback.print_exc()
+        return {'error': f'An unexpected error occurred during scraping: {e}'}
+
+    # Final checks before returning
+    if 'error' not in product_data and not product_data.get('image_urls'):
+        print("Warning: Scraper finished but found no image URLs.")
+        # Optionally return an error here if images are mandatory
+        # return {'error': 'No product images could be extracted.'}
+
+    return product_data
 
 def generate_marketing_script(title, description):
     """Generates a marketing script suitable for narration using OpenAI."""
@@ -345,36 +462,59 @@ def download_video(url, save_path):
         print(f"Error saving video to {save_path}: {e}")
         return False
 
-def download_image(url, save_path):
-    """Downloads an image from a URL and validates it."""
+# --- MODIFIED Helper: Download Image (Return pHash Object) ---
+def download_image(url, save_dir):
+    """Downloads image, returns path, content hash, and perceptual hash object."""
     try:
-        response = requests.get(url, stream=True, timeout=15)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, stream=True, timeout=20)
         response.raise_for_status()
         content_type = response.headers.get('content-type')
-        if content_type and not content_type.startswith('image/'):
-            print(f"Warning: URL {url} did not return an image content-type ({content_type}). Skipping overlay.")
-            return False
+        if not content_type or not content_type.lower().startswith('image/'):
+            print(f"Skipping non-image content type '{content_type}' from URL: {url}")
+            return None, None, None
+        image_content = response.content
+        if not image_content:
+             print(f"Skipping empty image content from URL: {url}")
+             return None, None, None
 
-        with open(save_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        # Calculate content hash
+        content_hash = hashlib.sha256(image_content).hexdigest()
+
+        # Calculate perceptual hash
+        perceptual_hash = None
+        img_format = 'jpg' # Default format
         try:
-            img = Image.open(save_path)
-            img.verify()
-            img.close()
-            return True
-        except (IOError, SyntaxError, Image.UnidentifiedImageError) as img_err:
-            print(f"Downloaded file at {save_path} is not a valid image: {img_err}")
-            if os.path.exists(save_path):
-                os.remove(save_path)
-            return False
+            with Image.open(io.BytesIO(image_content)) as img:
+                # Convert to grayscale for phash
+                perceptual_hash = imagehash.phash(img.convert('L'))
+                # Try to get original format for saving
+                if img.format: img_format = img.format.lower()
+
+        except Exception as pil_err:
+            print(f"  Warning: PIL/imagehash error for {url}: {pil_err}. Cannot calculate pHash.")
+            # Attempt to determine format anyway for saving
+            # ... (use fallback format detection logic from previous version if needed) ...
+            if 'jpeg' in content_type or 'jpg' in content_type: img_format = 'jpg'
+            elif 'png' in content_type: img_format = 'png'
+            # ... other formats ...
+
+        # Save the image
+        if not img_format or len(img_format) > 5: img_format = 'jpg'
+        filename = f"img_{content_hash[:10]}_{uuid.uuid4().hex[:8]}.{img_format}"
+        save_path = os.path.join(save_dir, filename)
+        with open(save_path, 'wb') as f:
+            f.write(image_content)
+
+        # Return path, content hash, and the pHash OBJECT (or None)
+        return save_path, content_hash, perceptual_hash
 
     except requests.exceptions.RequestException as e:
-        print(f"Error downloading image from {url}: {e}")
-        return False
+        print(f"Error downloading {url}: {e}")
+        return None, None, None
     except Exception as e:
-        print(f"Error saving image to {save_path}: {e}")
-        return False
+        print(f"Error processing image from {url}: {e}")
+        return None, None, None
 
 # --- NEW Helper: Generate Voiceover ---
 def generate_voiceover(text, output_path):
@@ -744,54 +884,128 @@ def generate_confirmation_route():
     # --- Scrape Product Data ---
     print(f"Scraping product data from: {product_url}")
     scraped_data = scrape_product_data(product_url)
-    if not scraped_data:
-        flash("Failed to scrape product data. Check URL or website structure.", "error")
-        return redirect(url_for('index'))
 
-    product_image_urls = scraped_data.get('image_urls', [])
+    # --- Handle Scraping Failure ---
+    if not scraped_data or 'error' in scraped_data:
+        error_message = scraped_data.get('error', 'Failed to scrape product data. The URL might be invalid, blocked, or the page structure is unsupported.') if isinstance(scraped_data, dict) else 'Failed to scrape product data.'
+        flash(error_message, 'danger')
+        print(f"Scraping failed for {product_url}: {error_message}")
+        return redirect(url_for('index')) # Redirect back to input form
+
     product_title = scraped_data.get('title', 'Product')
-    product_description = scraped_data.get('description', 'No description found.')
+    product_description = scraped_data.get('description', '')
+    image_urls = scraped_data.get('image_urls', [])
 
-    if not product_image_urls:
+    print("-" * 30)
+    print(f"DEBUG: URLs received by /generate route for download (Count: {len(image_urls)}):")
+    if image_urls:
+        for i, img_url in enumerate(image_urls): print(f"  URL {i+1} to download: {img_url}")
+    else: print("  No image URLs received from scraper.")
+    print("-" * 30)
+
+    if not image_urls:
         flash("Could not find any product images on the provided page.", "warning")
-        # Allow proceeding without images for avatar-only? Or redirect?
-        # For now, let's show confirmation even without images, user might want avatar only.
-        # If video_type is 'product', we should probably redirect here.
-        if video_type == 'product':
-             flash("No product images found, cannot generate product slideshow.", "error")
-             return redirect(url_for('index'))
+        print("Warning: Proceeding to confirmation page without any scraped images.")
 
+    # --- MODIFIED Download Images with Hashing & Stricter Size Check ---
+    confirm_image_details = []
+    downloaded_content_hashes = set()
+    downloaded_phashes = [] # Store pHash OBJECTS in a list for comparison
+    confirm_folder_basename = os.path.basename(app.config['CONFIRM_FOLDER'])
+    uploaded_avatar_path_relative = request.form.get('uploaded_avatar_path')
+    video_type = request.form.get('video_type', 'product') # Get video type
 
-    # --- Download Scraped Images Temporarily for Confirmation ---
-    confirm_image_details = [] # List of dicts: {'absolute_path': ..., 'relative_path': ...}
-    print(f"Downloading up to {MAX_PRODUCT_IMAGES} images for confirmation...")
-    confirm_folder_basename = os.path.basename(app.config['CONFIRM_FOLDER']) # e.g., 'confirm_temp'
-    generated_folder_basename = os.path.basename(app.config['GENERATED_FOLDER']) # e.g., 'generated'
+    print(f"Downloading images and checking for content & VISUAL duplicates (pHash Threshold: {PHASH_THRESHOLD})...")
+    urls_to_process = image_urls[:MAX_PRODUCT_IMAGES]
+    print(f"Processing max {len(urls_to_process)} URLs based on MAX_PRODUCT_IMAGES={MAX_PRODUCT_IMAGES}")
 
-    for i, img_url in enumerate(product_image_urls):
-        try:
-            img_ext = os.path.splitext(img_url)[1] or ".jpg"
-            # Ensure extension is valid image type
-            if img_ext.lower() not in ['.png', '.jpg', '.jpeg', '.webp', '.gif']:
-                img_ext = ".jpg" # Default to jpg if extension is weird
-            img_filename = f"confirm_{i}_{uuid.uuid4()}{img_ext}"
-            # Save images inside the 'confirm_temp' subfolder within 'generated'
-            img_path_absolute = os.path.join(app.config['CONFIRM_FOLDER'], img_filename)
-            if download_image(img_url, img_path_absolute):
-                # Store relative path for use in template and session
-                # Path relative to 'static' folder: e.g., 'generated/confirm_temp/confirm_0_xyz.jpg'
-                img_path_relative = os.path.join(generated_folder_basename, confirm_folder_basename, img_filename).replace("\\", "/")
-                confirm_image_details.append({
-                    'absolute_path': img_path_absolute,
-                    'relative_path': img_path_relative
-                })
-                print(f"Downloaded confirmation image: {img_path_relative}")
-            else:
-                print(f"Warning: Failed to download confirmation image {i+1}: {img_url}")
-        except Exception as e:
-             print(f"Error downloading confirmation image {i+1}: {e}")
-        if len(confirm_image_details) >= MAX_PRODUCT_IMAGES:
-            break # Stop if we hit the max
+    for i, img_url in enumerate(urls_to_process):
+        print(f"\nProcessing URL {i+1}/{len(urls_to_process)}: {img_url}")
+
+        absolute_path, content_hash, p_hash_obj = download_image(img_url, app.config['CONFIRM_FOLDER'])
+
+        if absolute_path and content_hash:
+            print(f"  --> Downloaded to: {os.path.basename(absolute_path)}")
+            print(f"  --> Content Hash: {content_hash}")
+            print(f"  --> Perceptual Hash Obj: {p_hash_obj}")
+
+            # Check 1: Exact Content Duplicate
+            if content_hash not in downloaded_content_hashes:
+                print(f"  --> Content Hash is NEW.")
+
+                # Check 2: Visual Duplicate (using Hamming distance)
+                is_visual_duplicate = False
+                if p_hash_obj is not None:
+                    for existing_phash in downloaded_phashes:
+                        distance = p_hash_obj - existing_phash
+                        print(f"    Comparing pHash distance to {existing_phash}: {distance}")
+                        if distance <= PHASH_THRESHOLD:
+                            is_visual_duplicate = True
+                            print(f"  --> Perceptual Hash is DUPLICATE (Distance {distance} <= {PHASH_THRESHOLD}). Skipping add.")
+                            break
+                    if not is_visual_duplicate:
+                         print(f"  --> Perceptual Hash is Visually NEW (Min distance > {PHASH_THRESHOLD}).")
+                else:
+                    print(f"  --> Perceptual Hash could not be calculated. Skipping visual check.")
+
+                # Proceed only if NOT a visual duplicate
+                if not is_visual_duplicate:
+                    size_ok = True # Assume size is okay initially
+                    # --- Stricter Size Check ---
+                    try:
+                        with Image.open(absolute_path) as img:
+                            width, height = img.size
+                            # *** INCREASED MINIMUM DIMENSION ***
+                            min_dimension = 400
+                            print(f"  --> Checking Size: {width}x{height} (Min: {min_dimension})")
+                            if width < min_dimension or height < min_dimension:
+                                 print(f"  --> Size Check FAILED. Skipping image.")
+                                 size_ok = False
+                                 try: os.remove(absolute_path)
+                                 except OSError as e: print(f"  Warning: Could not remove small image file: {e}")
+                            else:
+                                 print(f"  --> Size Check PASSED.")
+                    except Exception as size_err:
+                        print(f"  --> Warning: Could not check size: {size_err}")
+                        # *** ENSURE size_ok IS FALSE ON ERROR ***
+                        size_ok = False
+                        # Attempt cleanup even if size check failed due to error
+                        if os.path.exists(absolute_path):
+                             try: os.remove(absolute_path)
+                             except OSError as e: print(f"  Warning: Could not remove file after size check error: {e}")
+                    # --- End Size Check ---
+
+                    # Add to list only if content hash is new, not visually duplicate, AND size is okay
+                    if size_ok:
+                        downloaded_content_hashes.add(content_hash)
+                        if p_hash_obj is not None:
+                            downloaded_phashes.append(p_hash_obj)
+
+                        relative_path = url_for('static', filename=f'generated/{confirm_folder_basename}/{os.path.basename(absolute_path)}')
+                        confirm_image_details.append({
+                            'absolute_path': absolute_path,
+                            'relative_path': relative_path,
+                            'hash': content_hash,
+                            'phash': str(p_hash_obj) if p_hash_obj else None
+                        })
+                        print(f"  --> Added to confirm_image_details. Total unique images: {len(confirm_image_details)}")
+                else: # It was a visual duplicate
+                     # Clean up the visually duplicate file
+                     if os.path.exists(absolute_path):
+                         print(f"  --> Removing visually duplicate file: {os.path.basename(absolute_path)}")
+                         try: os.remove(absolute_path)
+                         except OSError as e: print(f"  Warning: Could not remove duplicate file {absolute_path}: {e}")
+
+            else: # Content hash already seen (exact duplicate)
+                print(f"  --> Content Hash is DUPLICATE (Exact match). Skipping add.")
+                # Clean up the newly downloaded exact duplicate file
+                if os.path.exists(absolute_path):
+                    print(f"  --> Removing exact duplicate file: {os.path.basename(absolute_path)}")
+                    try: os.remove(absolute_path)
+                    except OSError as e: print(f"  Warning: Could not remove duplicate file {absolute_path}: {e}")
+        else:
+             print(f"  --> Download FAILED or skipped for URL: {img_url}")
+
 
     if not confirm_image_details and video_type == 'product':
          flash("Failed to download any valid product images for confirmation.", "error")
@@ -801,22 +1015,27 @@ def generate_confirmation_route():
              except: pass
          return redirect(url_for('index'))
 
-    # --- Store data in session for the next step ---
+    # --- Store data in session ---
     session['confirm_data'] = {
         'product_title': product_title,
         'product_description': product_description,
         'video_type': video_type,
-        'uploaded_avatar_relative_path': uploaded_avatar_path_relative # Store relative path or None
+        'uploaded_avatar_relative_path': uploaded_avatar_path_relative
     }
-    # Store only the relative paths and absolute paths for cleanup later
     session['confirm_images'] = [{'relative_path': img['relative_path'], 'absolute_path': img['absolute_path']} for img in confirm_image_details]
 
-    print("Rendering confirmation page...")
-    # Pass only relative paths to the template
+    print("-" * 30)
+    print(f"DEBUG: Final unique images being sent to template (Count: {len(confirm_image_details)}):")
+    if confirm_image_details:
+        for i, img_detail in enumerate(confirm_image_details):
+             print(f"  Image {i+1}: Path={os.path.basename(img_detail['absolute_path'])}, CHash={img_detail['hash'][:10]}..., PHash={img_detail['phash']}")
+    else: print("  None")
+    print("-" * 30)
+    print(f"Rendering confirmation page with {len(confirm_image_details)} unique images.")
     return render_template('confirm.html',
                            product_title=product_title,
                            product_description=product_description,
-                           confirm_images=[img['relative_path'] for img in confirm_image_details], # Pass only relative paths
+                           confirm_images=[img['relative_path'] for img in confirm_image_details],
                            video_type=video_type)
 
 
