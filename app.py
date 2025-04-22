@@ -59,7 +59,7 @@ app.config['GENERATED_FOLDER'] = os.path.join('static', 'generated')
 app.config['CONFIRM_FOLDER'] = os.path.join(app.config['GENERATED_FOLDER'], 'confirm_temp')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Max upload size 16MB
 app.config['FONT_PATH'] = 'fonts/Poppins-Bold.ttf' # CHANGE TO YOUR POPPINS BOLD FILENAME
-MAX_PRODUCT_IMAGES = 8 # Limit the number of images to process
+MAX_PRODUCT_IMAGES = 12 # Limit the number of images to process
 PHASH_THRESHOLD = 5 # Define the perceptual hash threshold (lower = stricter)
 
 # Ensure upload and generated directories exist
@@ -1242,7 +1242,7 @@ def generate_confirmation_route():
                         if p_hash_obj is not None:
                             downloaded_phashes.append(p_hash_obj)
 
-                        relative_path = url_for('static', filename=f'generated/{confirm_folder_basename}/{os.path.basename(absolute_path)}')
+                        relative_path = os.path.join('generated', 'confirm_temp', os.path.basename(absolute_path))
                         confirm_image_details.append({
                             'absolute_path': absolute_path,
                             'relative_path': relative_path,
@@ -1514,6 +1514,36 @@ def uploaded_file(filename):
     # filename = secure_filename(filename)
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+# ------------------------------------------------------------------
+# NEW  ― AJAX image‑upload used by the "+" tile on confirm page
+# ------------------------------------------------------------------
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    """Receive an extra product image chosen on the confirm page,
+       save it into static/generated/confirm_temp/, add it to
+       session['confirm_images'], and return its relative path."""
+    if 'image' not in request.files:
+        return jsonify({'success': False, 'error': 'No file part'}), 400
+    f = request.files['image']
+    if f.filename == '':
+        return jsonify({'success': False, 'error': 'Empty filename'}), 400
+
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp'):
+        return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
+
+    filename  = f"user_{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(app.config['CONFIRM_FOLDER'], filename)
+    f.save(save_path)
+
+    rel_path = os.path.join('generated', 'confirm_temp', filename)  # used with url_for('static', …)
+
+    # ‑‑ Keep session list in sync so back‑end accepts it later
+    confirm_imgs = session.get('confirm_images', [])
+    confirm_imgs.append({'relative_path': rel_path, 'absolute_path': save_path})
+    session['confirm_images'] = confirm_imgs
+
+    return jsonify({'success': True, 'relative_path': rel_path})
 
 if __name__ == '__main__':
     # Make sure debug is False in production
