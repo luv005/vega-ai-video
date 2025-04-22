@@ -110,22 +110,22 @@ if not D_ID_API_KEY:
 
 # --- Helper Functions ---
 
-# --- REVISED Scrape Function (Clean URLs Before Adding) ---
+# --- REVISED Scrape Function (Wait for General Content Area) ---
 def scrape_product_data(url):
-    """Scrapes product data using Playwright, cleaning URLs to get high-res."""
+    """Scrapes product data using Playwright, waiting for general content area indicators."""
     print(f"Attempting to scrape with Playwright: {url}")
+    original_page_url = url          # <‑‑ keep a safe copy so later re‑use is reliable
     product_data = {'title': 'Product', 'description': 'No description found.', 'image_urls': []}
     html_content = None
+    screenshot_path = None
 
     try:
         with sync_playwright() as p:
             browser = None
             try:
-                browser = p.chromium.launch(headless=True) # Consider headless=False for debugging blocks
-                print("  Playwright browser launched.")
-            except Exception as launch_err:
-                 print(f"Error launching Playwright browser: {launch_err}")
-                 return {'error': 'Failed to launch browser. Run `playwright install`.'}
+                browser = p.chromium.launch(headless=True) # Keep headless
+                print("  Playwright browser launched (headless mode).")
+            except Exception as launch_err: return {'error': f'Failed to launch browser: {launch_err}'}
 
             # Use a realistic user agent
             user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
@@ -135,9 +135,7 @@ def scrape_product_data(url):
             print(f"  Navigating to {url}...")
 
             try:
-                # Go to the page
-                page.goto(url, wait_until='domcontentloaded', timeout=60000) # Wait for initial structure
-
+                page.goto(url, wait_until='domcontentloaded', timeout=60000)
                 # --- *** ADD CAPTCHA/BLOCK DETECTION *** ---
                 page_title = page.title().lower()
                 page_content_lower = page.content().lower() # Get page content for text checks
@@ -170,26 +168,93 @@ def scrape_product_data(url):
                     raise PlaywrightError("Scraping blocked (CAPTCHA/Block page detected).")
                 # --- *** END BLOCK DETECTION *** ---
 
-                # If not blocked, wait for dynamic content to potentially load
-                print("  No block detected, waiting for network idle...")
-                page.wait_for_load_state('networkidle', timeout=30000) # Wait for network activity to settle
+                # *** Attempt to dismiss common popups ***
+                print("  Attempting to dismiss common popups (e.g., cookie banners)...")
+                # ... (popup dismissal logic - same as before) ...
+                popup_selectors_to_try = [
+                    'button[aria-label*="accept"]', # Common aria-label for accept buttons
+                    'button[id*="cookie"]',         # IDs often contain "cookie"
+                    'button[class*="cookie"]',       # Classes often contain "cookie"
+                    'button:has-text("Accept")',     # Buttons with text "Accept"
+                    'button:has-text("Allow")',      # Buttons with text "Allow"
+                    'button:has-text("Agree")',      # Buttons with text "Agree"
+                    'button:has-text("Okay")',       # Buttons with text "Okay"
+                    'button[aria-label*="close"]',   # Close buttons on other popups
+                    'button[class*="close"]'         # Close buttons
+                ]
+                for i, selector in enumerate(popup_selectors_to_try):
+                    try:
+                        button = page.locator(selector).first
+                        if button.is_visible(timeout=2000):
+                            print(f"    Found potential popup button with selector {i+1}: '{selector}'. Clicking...")
+                            button.click(timeout=5000)
+                            print("    Clicked popup button. Waiting briefly...")
+                            page.wait_for_timeout(1500)
+                    except PlaywrightTimeoutError: pass
+                    except Exception as pop_err: print(f"    Error interacting with popup selector {i+1} ('{selector}'): {pop_err}")
+                print("  Finished attempting to dismiss popups.")
 
-                # Wait for essential elements (main image OR thumbnails)
-                print("  Waiting for main image OR thumbnail container...")
-                page.wait_for_selector('#imgTagWrapperId, #landingImage, #imgBlkFront, #altImages', timeout=20000)
-                print("  Essential elements appear loaded.")
+                # *** Primary Wait: Wait for ANY common content/image area selector ***
+                print("  Waiting up to 60s for general content/image area containers...")
+                # Combine general layout selectors with specific image container selectors
+                wait_selectors_for_content = [
+                    # General Layout / Product Sections
+                    'main[role="main"]',
+                    '#main-content',
+                    '#MainContent',
+                    '#ProductSection',
+                    '.product-template',
+                    '.product-page',
+                    '.productView', # BigCommerce common class
+                    '.product-details',
+                    'section[id*="product"]', # Sections with 'product' in ID
+                    'div[id*="product"]',     # Divs with 'product' in ID
+
+                    # Specific Image Containers (from previous attempts)
+                    # Amazon
+                    '#altImages', '#imgTagWrapperId', '#landingImage',
+                    # Shopify/Tentree/Common
+                    '.product__media-gallery', '.thumbnail-list__item',
+                    '.product-gallery', '.product__media-list',
+                    '.product-single__media-group', '.thumbnail-list',
+                    '.product__thumbnails',
+                    # ShopHorne
+                    '.product-gallery__carousel', '.product-gallery__thumbnails'
+                ]
+                # Remove duplicates just in case
+                wait_selectors_for_content = list(dict.fromkeys(wait_selectors_for_content))
+
+                page.wait_for_selector(
+                    ", ".join(wait_selectors_for_content), # Join selectors into a single string
+                    timeout=60000
+                 )
+                print("  Potential content/image area container found.")
+
+                # *** Optional: Add a short fixed delay ***
+                print("  Adding short delay for final rendering...")
+                page.wait_for_timeout(2500) # Keep a small delay
+
+                print("  Getting final page content...")
                 html_content = page.content()
 
             except PlaywrightTimeoutError as e:
-                print(f"  Timeout during Playwright navigation/waiting: {e}")
-                # Try getting content anyway, might be partial or the block page
-                html_content = page.content()
-                if not html_content: return {'error': 'Playwright timed out loading page content.'}
-                # Re-check for blocks if timeout occurred
-                if any(text in html_content.lower() for text in captcha_texts):
-                     print("  Block detected in content after timeout.")
-                     raise PlaywrightError("Scraping blocked (CAPTCHA/Block page detected after timeout).")
-                print("  Proceeding with potentially partial content after timeout.")
+                # Timeout means none of the general selectors were found
+                print(f"  Timeout waiting for general content/image area selectors: {e}")
+                # ... (Screenshot logic - same as before) ...
+                try:
+                    screenshot_filename = f"timeout_screenshot_{uuid.uuid4().hex[:8]}.png"
+                    screenshot_path = os.path.join(app.config['GENERATED_FOLDER'], screenshot_filename)
+                    page.screenshot(path=screenshot_path, full_page=True)
+                    print(f"  Screenshot taken on timeout: {screenshot_path}")
+                except Exception as screen_err: print(f"  Failed to take screenshot: {screen_err}")
+
+                # ... (rest of timeout handling - same as before) ...
+                try: html_content = page.content() # Still try to get content
+                except Exception: html_content = None
+                if html_content and any(text in html_content.lower() for text in captcha_texts): raise PlaywrightError("Scraping blocked after timeout.")
+                elif not html_content: raise PlaywrightError("Playwright timed out waiting for content area and failed to retrieve page content.")
+                else: print("  Proceeding with content, but no expected content/image selectors were found within timeout.")
+
             except PlaywrightError as e: # Catch errors raised explicitly (like our block detection)
                  print(f"  Playwright operation error: {e}")
                  raise # Re-raise to be caught by the outer try/except
@@ -204,90 +269,280 @@ def scrape_product_data(url):
         # --- Process the HTML obtained from Playwright ---
         if html_content:
             soup = BeautifulSoup(html_content, 'html.parser')
-            # --- Extract Title ---
-            title_tag = soup.select_one('#productTitle')
+            # --- Extract Title & Description (Keep general selectors) ---
+            title_tag = soup.select_one('#productTitle, .product-title, .product__title, .product-single__title, h1')
             title = title_tag.get_text(strip=True) if title_tag else 'Product Title Not Found'
             product_data['title'] = title
             print(f"  Extracted Title: {title}")
 
-            # --- Extract Description ---
-            desc_tag = soup.select_one('#feature-bullets')
+            desc_tag = soup.select_one('#feature-bullets, .product-description, '
+                                        '.product__description, .product-single__description, .rte')
             description = desc_tag.get_text(separator='\n', strip=True) if desc_tag else 'No description found.'
-            product_data['description'] = description
-            # print(f"  Extracted Description: {description[:100]}...") # Optional: log description start
 
-            # --- Extract HIGH-RES Images (CLEAN URLs) ---
+            # --------  EXTRA DESCRIPTION FALL‑BACKS  --------
+            if not description or description == 'No description found.':
+                # 1)  Open‑Graph / meta‑description
+                meta_desc = (soup.find('meta', {'property': 'og:description'})
+                             or soup.find('meta', {'name': 'description'}))
+                if meta_desc and meta_desc.get('content'):
+                    description = meta_desc['content'].strip()
+
+            if (not description or description == 'No description found.'):
+                # 2)  JSON‑LD blocks – Shopify often stores body copy here
+                for script in soup.find_all('script', type='application/ld+json'):
+                    try:
+                        data = json.loads(script.string or '')
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get('description'):
+                        description = BeautifulSoup(data['description'],
+                                                     'html.parser').get_text(" ", strip=True)
+                        break
+
+            product_data['description'] = description
+            # print(f"  Extracted Description: {description[:100]}...")
+
+            # --- Extract Images (Try Amazon THEN Shopify patterns) ---
             image_urls = set()
 
-            # Method 1: data-a-dynamic-image (Primary source - CLEAN URLs)
-            main_image_tag = soup.select_one('#imgTagWrapperId img, #landingImage, #imgBlkFront')
-            if main_image_tag:
-                print("  Looking for 'data-a-dynamic-image'...")
-                dynamic_image_data = main_image_tag.get('data-a-dynamic-image')
+            # == Amazon Method 1: data-a-dynamic-image ==
+            main_image_tag_amazon = soup.select_one('#imgTagWrapperId img, #landingImage, #imgBlkFront')
+            if main_image_tag_amazon:
+                print("  Attempting Amazon Method 1: data-a-dynamic-image...")
+                dynamic_image_data = main_image_tag_amazon.get('data-a-dynamic-image')
                 if dynamic_image_data and isinstance(dynamic_image_data, str):
                     try:
                         image_map = json.loads(dynamic_image_data)
-                        print(f"  Found {len(image_map)} URLs in data-a-dynamic-image.")
+                        print(f"    Found {len(image_map)} URLs in data-a-dynamic-image.")
                         for img_url in image_map.keys():
-                             print(f"    Raw URL from dynamic data: {img_url}")
                              if isinstance(img_url, str) and img_url.startswith('http'):
-                                 # *** CLEAN THE URL ***
-                                 cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', img_url)
-                                 print(f"    Cleaned URL: {cleaned_url}")
-                                 # Ensure it still looks like an image URL after cleaning
+                                 cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', img_url) # Amazon cleaning
                                  if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                                     image_urls.add(cleaned_url) # Add the cleaned URL
-                                 else:
-                                     print(f"    Skipping cleaned URL (invalid extension?): {cleaned_url}")
-                    except json.JSONDecodeError:
-                        print("  Warning: Failed to parse data-a-dynamic-image JSON.")
-                        # Fallback to src if dynamic data fails parsing (CLEAN URL)
-                        src = main_image_tag.get('src')
-                        if src and src.startswith('http'):
-                             print(f"    Raw fallback src: {src}")
-                             cleaned_url = re.sub(r'\._.*?_\.', '.', src) # Use simpler regex for basic src fallback
-                             print(f"    Cleaned fallback src: {cleaned_url}")
-                             if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                                 image_urls.add(cleaned_url)
-                # Fallback to src if dynamic data attribute is missing (CLEAN URL)
-                elif main_image_tag.get('src'):
-                     src = main_image_tag.get('src')
-                     print("  'data-a-dynamic-image' not found. Using 'src' attribute.")
+                                     image_urls.add(cleaned_url)
+                    except json.JSONDecodeError: print("    Warning: Failed to parse Amazon data-a-dynamic-image JSON.")
+                elif main_image_tag_amazon.get('src'): # Fallback src
+                     src = main_image_tag_amazon.get('src')
                      if src.startswith('http'):
-                         print(f"    Raw fallback src: {src}")
-                         cleaned_url = re.sub(r'\._.*?_\.', '.', src)
-                         print(f"    Cleaned fallback src: {cleaned_url}")
-                         if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                             image_urls.add(cleaned_url)
+                         cleaned_url = re.sub(r'\._.*?_\.', '.', src) # Basic cleaning
+                         if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')): image_urls.add(cleaned_url)
             else:
-                 print("  Warning: Could not find main image tag.")
+                 print("  Amazon main image tag for dynamic data not found.")
 
-            # Method 2: Thumbnail Scraping (#altImages - CLEAN URLs)
-            print("  Looking for thumbnails in #altImages...")
-            thumbnail_container = soup.select_one('#altImages')
-            if thumbnail_container:
-                thumb_elements = thumbnail_container.select('li.item img')
-                print(f"  Found {len(thumb_elements)} potential thumbnail img elements in #altImages.")
+            # == Amazon Method 2: #altImages Thumbnails ==
+            thumbnail_container_amazon = soup.select_one('#altImages')
+            if thumbnail_container_amazon:
+                print("  Attempting Amazon Method 2: #altImages thumbnails...")
+                thumb_elements = thumbnail_container_amazon.select('li.item img')
+                print(f"    Found {len(thumb_elements)} potential Amazon thumbnail img elements.")
                 for thumb in thumb_elements:
                     thumb_src = thumb.get('src')
-                    print(f"    Raw thumbnail src: {thumb_src}")
-                    if thumb_src and thumb_src.startswith('http') and 'loading-' not in thumb_src and 'spinner' not in thumb_src and 'pixel.gif' not in thumb_src:
-                        # *** CLEAN THE URL ***
-                        cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', thumb_src)
-                        print(f"    Cleaned thumbnail URL: {cleaned_url}")
-                        # Ensure it still looks like an image URL after cleaning
+                    if thumb_src and thumb_src.startswith('http') and 'loading-' not in thumb_src:
+                        cleaned_url = re.sub(r'\._[A-Z0-9,_]+_\.', '.', thumb_src) # Amazon cleaning
                         if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                            image_urls.add(cleaned_url) # Add the cleaned URL
-                        else:
-                            print(f"    Skipping cleaned thumbnail URL (invalid extension?): {cleaned_url}")
+                            image_urls.add(cleaned_url)
             else:
-                 print("  Thumbnail container #altImages not found.")
+                print("  Amazon thumbnail container #altImages not found.")
 
-            # Finalize list
+            # == Shopify Method 1: Main Product Image src/srcset ==
+            if len(image_urls) < 3:
+                print("  Attempting Shopify Method 1: Main image src/srcset...")
+                main_image_selectors = [
+                    '.product-gallery__carousel-item img.product-gallery__image', # ShopHorne
+                    '.product__media-item img[loading="eager"]', # Tentree
+                    '.product__media-item img', # Tentree
+                    '.product-gallery .product-main-image img',
+                    '.product-single__photo',
+                    'img.feature-row__image'
+                ]
+                main_image_tags_shopify = []
+                for selector in main_image_selectors:
+                     found_tags = soup.select(selector)
+                     if found_tags:
+                         print(f"    Found {len(found_tags)} potential Shopify main image tag(s) using selector: {selector}")
+                         main_image_tags_shopify.extend(found_tags)
+                         # Don't break, collect from all matching selectors if needed, rely on set for uniqueness
+
+                if main_image_tags_shopify:
+                    print(f"    Processing {len(main_image_tags_shopify)} total potential main image tags...")
+                    for img_tag in main_image_tags_shopify:
+                        srcset = img_tag.get('srcset')
+                        main_src = img_tag.get('src')
+                        found_src = None
+                        # ... (srcset parsing logic - same as before) ...
+                        if srcset:
+                            # print(f"    Processing srcset: {srcset[:100]}...")
+                            try:
+                                # Get the highest resolution from srcset (often last or has largest 'w' descriptor)
+                                candidates = []
+                                for entry in srcset.strip().split(','):
+                                    parts = entry.strip().split()
+                                    if len(parts) == 2 and parts[1].endswith('w'):
+                                        try: candidates.append((int(parts[1][:-1]), parts[0]))
+                                        except ValueError: pass
+                                    elif len(parts) == 1: # Just a URL
+                                        candidates.append((0, parts[0])) # Assign 0 width if no descriptor
+                                if candidates:
+                                    candidates.sort(key=lambda x: x[0], reverse=True) # Sort by width desc
+                                    url_part = candidates[0][1] # Get URL of largest width
+                                    if url_part.startswith('//'): url_part = 'https:' + url_part
+                                    if url_part.startswith('http'): found_src = url_part
+                            except Exception as e: print(f"      Error parsing srcset: {e}")
+
+                        if not found_src and main_src: # Fallback to src
+                             # print(f"    Using src attribute: {main_src}")
+                             if main_src.startswith('//'): main_src = 'https:' + main_src
+                             if main_src.startswith('http') and 'data:image' not in main_src: found_src = main_src
+
+                        if found_src:
+                            # *** Shopify URL Cleaning *** (same as before)
+                            cleaned_url = re.sub(r'_\d+x\d*\.', '.', found_src)
+                            cleaned_url = re.sub(r'_(pico|icon|thumb|small|compact|medium|large|grande|original|1024x1024|2048x2048|master|\d+x\d*|\d*x\d+)(?=\.[^.]+$)', '', cleaned_url)
+                            cleaned_url = cleaned_url.split('?')[0]
+                            # print(f"    Cleaned Shopify main image URL: {cleaned_url}")
+                            if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                image_urls.add(cleaned_url)
+                else:
+                     print("    No Shopify main image tag found using common selectors.")
+
+            # == Shopify Method 2: Thumbnail Images ==
+            if len(image_urls) < 5:      # only if we still need more
+                print("  Attempting Shopify Method 2: Thumbnails...")
+                thumbnail_selectors = [
+                     # *** Tentree Specific Thumbnail Selector ***
+                    '.product-gallery__thumbnails a.product-gallery__thumbnail img', # ShopHorne
+                     # Other common selectors
+                    '.thumbnail-list__item button img', # Tentree
+                    '.thumbnail-list__item img',        # <- NEW: Tentree/Liquid themes
+                    '.product__thumbnails .thumbnail img',
+                    '.productView-thumbnails .slick-slide img',
+                    '.product-single__thumbnails .product-single__thumbnail img',
+                    'a.thumbnail img',
+                    'button.thumbnail img'
+                ]
+                thumb_elements = []
+                for selector in thumbnail_selectors:
+                     found_elements = soup.select(selector)
+                     if found_elements:
+                         print(f"    Found {len(found_elements)} potential Shopify thumbnail elements using selector: {selector}")
+                         thumb_elements.extend(found_elements)
+                         # Don't break, collect all
+
+                if thumb_elements:
+                    print(f"    Processing {len(thumb_elements)} total potential thumbnail elements...")
+                    for thumb in thumb_elements:
+                        thumb_src = thumb.get('src')
+                        if thumb_src:
+                            if thumb_src.startswith('//'): thumb_src = 'https:' + thumb_src
+                            if thumb_src.startswith('http') and 'data:image' not in thumb_src:
+                                # *** Shopify URL Cleaning *** (same as before)
+                                cleaned_url = re.sub(r'_\d+x\d*\.', '.', thumb_src)
+                                cleaned_url = re.sub(r'_(pico|icon|thumb|small|compact|medium|large|grande)\.', '.', cleaned_url)
+                                cleaned_url = cleaned_url.split('?')[0]
+                                # print(f"    Cleaned Shopify thumbnail URL: {cleaned_url}")
+                                if cleaned_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                                    image_urls.add(cleaned_url)
+                else:
+                     print("    No Shopify thumbnail elements found using common selectors.")
+
+            # ------------------------------------------------------------
+            # == FALLBACK – Capture ANY img / <source> including srcset ==
+            # ------------------------------------------------------------
+            def _add_from_srcset(srcset_str: str):
+                for entry in srcset_str.split(','):
+                    url_part = entry.strip().split(' ')[0]
+                    if url_part.startswith('//'): url_part = 'https:' + url_part
+                    if url_part.startswith('http'):
+                        image_urls.add(url_part.split('?')[0])
+
+            if len(image_urls) < 3:  # still too few? scan everything
+                print("  Attempting Generic Fallback: scanning <img> & <source> tags ...")
+                for tag in soup.find_all(['img', 'source']):
+                    # --- direct URLs ---
+                    for attr in ('src', 'data-src', 'data-image', 'data-lazy'):
+                        url = tag.get(attr)
+                        if url and not url.startswith('data:'):
+                            if url.startswith('//'): url = 'https:' + url
+                            if url.startswith('http'):
+                                image_urls.add(url.split('?')[0])
+                    # --- srcset style attributes ---
+                    for attr in ('srcset', 'data-srcset'):
+                        ss = tag.get(attr)
+                        if ss: _add_from_srcset(ss)
+
+            # ------------------------------------------------------------
+            # == FALLBACK 1 : Open-Graph & Twitter meta tags ==
+            # ------------------------------------------------------------
+            if not image_urls:
+                print("  Attempting Fallback 1: <meta property='og:image'> / twitter:image ...")
+                meta_selectors = [
+                    'meta[property="og:image"]',
+                    'meta[property="og:image:secure_url"]',
+                    'meta[name="twitter:image"]'
+                ]
+                for sel in meta_selectors:
+                    for m in soup.select(sel):
+                        url = m.get('content')
+                        if url and url.startswith(('http', '//')):
+                            if url.startswith('//'): url = 'https:' + url
+                            image_urls.add(url.split('?')[0])
+
+            # ------------------------------------------------------------
+            # == FALLBACK 2 : JSON-LD "image" arrays (Shopify, Woo, etc.) ==
+            # ------------------------------------------------------------
+            if len(image_urls) < 3:  # only if still empty / few
+                print("  Attempting Fallback 2: JSON-LD blocks with image data ...")
+                for script in soup.find_all('script', type='application/ld+json'):
+                    try:
+                        data = json.loads(script.string or '')
+                    except Exception:
+                        continue
+                    # `image` can be str or list; sometimes nested in `offers` / `item`
+                    potential_imgs = []
+                    if isinstance(data, dict):
+                        if 'image' in data:
+                            potential_imgs = data['image']
+                        elif 'images' in data:
+                            potential_imgs = data['images']
+                    if isinstance(potential_imgs, str):
+                        potential_imgs = [potential_imgs]
+                    for url in potential_imgs:
+                        if isinstance(url, str) and url.startswith(('http', '//')):
+                            if url.startswith('//'): url = 'https:' + url
+                            image_urls.add(url.split('?')[0])
+
+            # ------------------------------------------------------------
+            # --- Shopify gallery‑only filter ----------------------------
+            shopify_handle = None
+            m = re.search(r'/products/([^/?#]+)', original_page_url.lower())
+            if m:
+                shopify_handle = m.group(1)          # e.g. "virka-sideboard-low"
+
+            if shopify_handle:
+                before_cnt = len(image_urls)
+
+                def _keep(url: str) -> bool:
+                    low = url.lower()
+                    # consider any Shopify‑style CDN path, host may be custom
+                    if '/cdn/shop/' not in low:
+                        return True                   # keep non‑Shopify‑CDN images
+                    # must live under /products/ AND mention the handle
+                    if '/products/' in low and (
+                        shopify_handle in low
+                        or shopify_handle.replace('-', '_') in low
+                    ):
+                        return True
+                    return False                     # drop /files/ etc.
+
+                filtered = [u for u in image_urls if _keep(u)]
+                if filtered:                         # only enforce if we still have images
+                    image_urls = filtered
+                    print(f"  Shopify gallery filter '{shopify_handle}': {before_cnt} → {len(image_urls)} images")
+            # ------------------------------------------------------------
+
             product_data['image_urls'] = list(image_urls)
 
             # --- Logging ---
-            print("-" * 30); print(f"DEBUG: Found {len(product_data['image_urls'])} unique CLEANED URLs after scraping:")
+            print("-" * 30); print(f"DEBUG: Found {len(product_data['image_urls'])} unique CLEANED URLs after scraping (incl. fall‑backs):")
             if product_data['image_urls']:
                 for i, img_url in enumerate(product_data['image_urls']): print(f"  URL {i+1}: {img_url}")
             else: print("  No image URLs found.")
@@ -295,18 +550,24 @@ def scrape_product_data(url):
             print(f"Scraped Title via Playwright: {product_data['title']}")
             print(f"Found {len(product_data['image_urls'])} unique image URLs via Playwright.")
         else:
-             # This case might happen if Playwright failed very early
-             print("Error: No HTML content was retrieved by Playwright.")
-             return {'error': 'Playwright failed to retrieve page content.'}
+             # This case now also handles failure to get content after timeout
+             print("Error: No HTML content was retrieved by Playwright (possibly due to timeout or other error).")
+             # Return error only if html_content is None *and* no specific PlaywrightError was returned earlier
+             if 'error' not in product_data:
+                 product_data['error'] = 'Playwright failed to retrieve page content.'
 
-    except PlaywrightError as e: # Catch errors from Playwright steps or explicit raises
+    except PlaywrightError as e:
         print(f"Playwright scraping failed: {e}")
-        return {'error': f'{e}'} # Return the specific error message
+        error_details = f'{e}'
+        if screenshot_path: error_details += f' Check screenshot: {screenshot_path}'
+        return {'error': error_details}
     except Exception as e:
         print(f"An unexpected error occurred during Playwright scraping: {e}")
         import traceback
         traceback.print_exc()
-        return {'error': f'An unexpected error occurred during scraping: {e}'}
+        error_details = f'An unexpected error occurred during scraping: {e}'
+        if screenshot_path: error_details += f' Check screenshot: {screenshot_path}'
+        return {'error': error_details}
 
     # Final checks before returning
     if 'error' not in product_data and not product_data.get('image_urls'):
