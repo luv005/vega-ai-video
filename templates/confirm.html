@@ -105,6 +105,22 @@
             min-height: 150px; /* Give textarea a decent height */
             resize: vertical; /* Allow vertical resizing */
         }
+        /* ---------- basic gallery tile look (already exists) ---------- */
+        .image-grid          { display:flex; flex-wrap:wrap; gap:18px; }
+        .image-tile          { position:relative; width:180px; height:180px;
+                               border-radius:10px; overflow:hidden; cursor:pointer; }
+        .image-tile img      { width:100%; height:100%; object-fit:contain; }
+        .image-tile .checkmark { position:absolute; top:6px; left:6px;
+                                 background:#557CFF; color:#fff; padding:2px 4px;
+                                 border-radius:4px; font-size:14px; display:none; }
+        .image-tile.selected .checkmark { display:block; }
+
+        /* ---------- PLUS / upload tile ---------- */
+        .upload-tile             { background:#2A2A2A; display:flex;
+                                   flex-direction:column; align-items:center; justify-content:center; }
+        .upload-tile .plus-icon  { color:#fff; font-size:60px; line-height:1; pointer-events:none; }
+        .upload-tile .upload-text{ color:#fff; font-size:14px; margin-top:4px; pointer-events:none; }
+        .upload-tile:hover       { background:#3a3a3a; }
     </style>
 </head>
 <body>
@@ -146,19 +162,23 @@
 
             <div class="mb-3">
                 <label class="form-label"><strong>Select Images to Use:</strong></label>
-                {% if confirm_images %}
-                    <div class="image-grid">
-                        {% for image_path in confirm_images %}
-                        <div class="image-item">
-                            <img src="{{ image_path }}" alt="Product Image {{ loop.index }}" class="confirm-image">
-                            <input type="checkbox" name="selected_images" value="{{ image_path }}" checked>
-                        </div>
-                        {% endfor %}
+                <!-- === GALLERY CONTAINER =================================== -->
+                <div id="image-container" class="image-grid">
+
+                    <!--  Upload‑plus tile  -->
+                    <div id="upload-tile" class="image-tile upload-tile">
+                        <span class="plus-icon">+</span>
+                        <span class="upload-text">Upload</span>
+                        <input id="uploadInput" type="file" accept="image/*" multiple hidden>
                     </div>
-                     <small class="form-text text-muted">Check the images you want to include in the video. (Max 5 recommended for slideshows).</small>
-                {% else %}
-                    <p class="text-muted">No product images were found or downloaded.</p>
-                {% endif %}
+
+                    {% for img in confirm_images %}
+                      <div class="image-tile selectable{% if loop.index0 < 8 %} selected{% endif %}" data-path="{{ img }}">
+                          <img src="{{ url_for('static', filename=img) }}" />
+                          <span class="checkmark">&#10003;</span>
+                      </div>
+                    {% endfor %}
+                </div>
             </div>
 
             <!-- Hidden input to carry video type -->
@@ -201,6 +221,57 @@
         // *** Get the description textarea ***
         const descriptionTextarea = document.getElementById('product-description');
 
+        const container   = document.getElementById('image-container');
+        const uploadTile  = document.getElementById('upload-tile');
+        const uploadInput = document.getElementById('uploadInput');
+
+        /* toggle selection on normal tiles -------------------------------- */
+        function toggleSelect(e){
+            const tile = e.currentTarget;
+            tile.classList.toggle('selected');
+        }
+        document.querySelectorAll('.image-tile.selectable')
+                .forEach(t => t.addEventListener('click', toggleSelect));
+
+        /* open explorer when + clicked ------------------------------------ */
+        uploadTile.addEventListener('click', () => uploadInput.click());
+
+        /* handle chosen files --------------------------------------------- */
+        uploadInput.addEventListener('change', evt => {
+            const files = Array.from(evt.target.files);
+            files.forEach(file => {
+                const fd = new FormData();
+                fd.append('image', file);
+
+                fetch('{{ url_for("upload_image") }}', { method:'POST', body: fd })
+                  .then(r => r.json())
+                  .then(data => {
+                      if (!data.success) { alert(data.error || 'Upload failed'); return; }
+                      addTile(data.relative_path);
+                  });
+            });
+            uploadInput.value = '';               // reset so same file can be re‑picked
+        });
+
+        /* helper that injects a new selectable tile ----------------------- */
+        function addTile(relPath){
+            const tile = document.createElement('div');
+            tile.className = 'image-tile selectable selected';   // auto‑selected
+            tile.dataset.path = relPath;
+
+            const img = document.createElement('img');
+            img.src = '{{ url_for("static", filename="") }}' + relPath;
+
+            const mark = document.createElement('span');
+            mark.className = 'checkmark';
+            mark.innerHTML = '&#10003;';
+
+            tile.appendChild(img);
+            tile.appendChild(mark);
+            tile.addEventListener('click', toggleSelect);
+            container.appendChild(tile);
+        }
+
         form.addEventListener('submit', async function(event) {
             event.preventDefault(); // Prevent default form submission
 
@@ -213,12 +284,10 @@
             // Clear previous results
             videoResultDiv.innerHTML = '';
 
-            // Get selected image paths
-            const selectedImages = [];
-            const checkboxes = form.querySelectorAll('input[name="selected_images"]:checked');
-            checkboxes.forEach(checkbox => {
-                selectedImages.push(checkbox.value);
-            });
+            // Collect selected tiles instead of (removed) check‑boxes
+            const selectedImages = Array.from(
+                document.querySelectorAll('.image-tile.selectable.selected')
+            ).map(t => t.dataset.path);
 
             // *** Get the EDITED description from the textarea ***
             const editedDescription = descriptionTextarea.value;
@@ -234,8 +303,9 @@
                         // Add CSRF token header if you implement CSRF protection
                     },
                     body: JSON.stringify({
-                        selected_images: selectedImages,
-                        product_description: editedDescription
+                        selected_images:      selectedImages,
+                        product_description:  editedDescription,
+                        video_type:           "{{ video_type }}"
                     })
                 });
 

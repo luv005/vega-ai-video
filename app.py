@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from moviepy.editor import (VideoFileClip, ImageClip, CompositeVideoClip, ColorClip,
                             TextClip, concatenate_videoclips, AudioFileClip) # Added ColorClip, TextClip, concatenate, AudioFileClip
 from moviepy.video.fx.all import fadein, fadeout # Import fade effects
-from PIL import Image, ImageOps, ImageFont, ImageDraw, ImageFilter # Import more from Pillow and ImageFilter
+from PIL import Image, ImageOps, ImageFont, ImageDraw, ImageFilter  # Pillow
 import numpy as np
 import math # For ceiling function
 import platform # Import platform module
@@ -837,7 +837,12 @@ def get_word_timestamps(audio_path):
 
 # --- MODIFIED Helper: Generate Slideshow Video with Padded Images ---
 def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
-    """Generates slideshow with images resized to fit frame (padded), adaptive frame size, and rounded captions."""
+    """
+    Creates a simple Ken‑Burns style slideshow video.
+    If `audio_path` is supplied the clip is trimmed / stretched to that
+    audio's duration and the audio is attached.  If it is None the
+    slideshow length is image_count × 3 s.
+    """
     print("Starting slideshow video generation with images padded to fit frame...")
 
     # Frame dimensions (will be adjusted based on images)
@@ -898,18 +903,30 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         target_aspect = W / H
 
         # 2. Load Audio & Get Timestamps (existing logic)
-        print("Loading audio and getting word timestamps...")
-        audio_clip = AudioFileClip(audio_path)
-        total_duration = audio_clip.duration
-        word_timestamps = get_word_timestamps(audio_path) # Use helper
-        if not word_timestamps:
-            print("Warning: Could not get word timestamps. Captions will not be generated.")
+        print("Loading audio (if any) and getting word timestamps …")
 
-        # 3. Calculate Image Durations (existing logic)
+        audioclip       = None
+        total_duration  = None      # length of entire slideshow
+        word_timestamps = []        # default: no captions
+
+        if audio_path:
+            # ---- Audio supplied  → use its exact duration --------------
+            audioclip      = AudioFileClip(audio_path)
+            total_duration = audioclip.duration
+            word_timestamps = get_word_timestamps(audio_path)
+            if not word_timestamps:
+                print("  Warning: Could not get word timestamps. Captions will not be generated.")
+        else:
+            # ---- No audio supplied → make a silent slideshow -----------
+            seconds_per_image = 3
+            total_duration    = seconds_per_image * len(image_paths)
+            print(f"  No audio provided → using {seconds_per_image}s per image "
+                  f"(total {total_duration:.2f}s).")
+
         num_images = len(valid_image_paths)
         if num_images == 0: raise ValueError("No valid images provided for slideshow.")
         base_image_duration = total_duration / num_images
-        print(f"Total duration: {total_duration:.2f}s, Num images: {num_images}, Base duration/image: {base_image_duration:.2f}s")
+        print(f"  Num images: {num_images},  Base duration/image: {base_image_duration:.2f}s")
 
         # 4. Create Image Clips with Fit-Inside (Padding)
         print(f"Processing {num_images} images for slideshow frame {W}x{H} with padding...")
@@ -1066,7 +1083,8 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
             final_composite_elements.extend(text_clips_list)
         # Ensure the final composite uses the determined W, H
         final_video_sequence = CompositeVideoClip(final_composite_elements, size=(W, H))
-        final_video_sequence = final_video_sequence.set_duration(total_duration).set_audio(audio_clip)
+        if audioclip:
+            final_video_sequence = final_video_sequence.set_audio(audioclip)
 
         # 8. Add Overall Fade In/Out (Optional)
         # final_video_sequence = final_video_sequence.fadein(fade_duration).fadeout(fade_duration)
@@ -1090,7 +1108,7 @@ def generate_slideshow_video(image_paths, audio_path, output_path, font_path):
         return False
     finally:
         # 10. Close all clips
-        if audio_clip: audio_clip.close()
+        if audioclip: audioclip.close()
         if final_video_sequence: final_video_sequence.close()
         if 'video_sequence' in locals() and video_sequence: video_sequence.close()
         for clip in clips: # Close individual image clips
@@ -1336,7 +1354,10 @@ def create_video_route():
     product_title = confirm_data.get('product_title', 'Product')
     # *** Use the EDITED description if provided, otherwise fallback to session ***
     product_description = edited_product_description if edited_product_description is not None else confirm_data.get('product_description', '')
-    video_type = confirm_data.get('video_type', 'product')
+    # 1) prefer what the browser sent this time, else fall back to session
+    video_type = request_data.get('video_type') or confirm_data.get('video_type', 'product')
+    print(f"Video‑type resolved to: {video_type}  (JSON overrode session)" if request_data.get('video_type')
+          else f"Video‑type taken from session: {video_type}")
     uploaded_avatar_relative_path = confirm_data.get('uploaded_avatar_relative_path')
 
     # *** Log which description is being used ***
@@ -1405,25 +1426,141 @@ def create_video_route():
                 if not download_video(result_url, temp_did_video_path): error_message = "Video download failed"
 
             if not error_message:
-                final_video_filename = f"final_avatar_{uuid.uuid4()}.mp4"
-                final_video_path = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
-                if downloaded_overlay_image_path and os.path.exists(downloaded_overlay_image_path):
-                    print("Compositing D-ID video with selected product image overlay...")
+                # ----------------------------------------------------------
+                # 1) Build slideshow background from selected images
+                # ----------------------------------------------------------
+                if not error_message:
+                    print("Creating background slideshow for avatar …")
+                    bg_filename   = f'bg_{uuid.uuid4()}.mp4'
+                    bg_video_path = os.path.join(app.config['GENERATED_FOLDER'], bg_filename)
+
+                    # Use the images the user picked; fall back to first 8
+                    bg_images = selected_absolute_paths or [
+                        img['absolute_path'] for img in confirm_images_info
+                    ][:8]
+
+                    generate_slideshow_video(
+                        bg_images,
+                        None,                   # no audio for BG
+                        bg_video_path,
+                        app.config['FONT_PATH']
+                    )
+
+                # ----------------------------------------------------------
+                # 2) Composite avatar over that slideshow (bottom‑left)
+                # ----------------------------------------------------------
+                if not error_message:
+                    print("Compositing avatar onto slideshow background …")
+                    final_video_filename = f"final_avatar_{uuid.uuid4()}.mp4"
+                    final_video_path     = os.path.join(app.config['GENERATED_FOLDER'], final_video_filename)
+
                     try:
-                        video_clip = VideoFileClip(temp_did_video_path)
-                        img_clip = ImageClip(downloaded_overlay_image_path).resize(width=video_clip.w * 0.25).set_position(('right','bottom')).set_duration(video_clip.duration)
-                        final_clip = CompositeVideoClip([video_clip, img_clip], size=video_clip.size)
-                        final_clip.write_videofile(final_video_path, codec='libx264', audio_codec='aac', temp_audiofile='temp-avatar-audio.m4a', remove_temp=True, preset='medium', ffmpeg_params=["-profile:v","baseline", "-level","3.0", "-pix_fmt", "yuv420p"])
-                        img_clip.close(); video_clip.close(); final_clip.close(); print("Overlay successful.")
+                        print(f"  Loading background clip: {bg_video_path}")
+                        bg_clip     = VideoFileClip(bg_video_path)
+                        print(f"  Loading avatar clip: {temp_did_video_path}")
+                        avatar_clip = VideoFileClip(temp_did_video_path)
+
+                        # --- Add Validity Checks ---
+                        if not bg_clip or bg_clip.duration is None or bg_clip.duration <= 0:
+                            raise ValueError(f"Background clip is invalid or has zero duration: {bg_video_path}")
+                        if not avatar_clip or avatar_clip.duration is None or avatar_clip.duration <= 0:
+                            raise ValueError(f"Avatar clip is invalid or has zero duration: {temp_did_video_path}")
+                        print(f"  BG Clip loaded: duration={bg_clip.duration:.2f}s, size={bg_clip.size}")
+                        print(f"  Avatar Clip loaded: duration={avatar_clip.duration:.2f}s, size={avatar_clip.size}")
+                        # --- End Validity Checks ---
+
+                        # -------------------------------------------------------
+                        # 1. Create a new clip with the avatar at a fixed size
+                        # -------------------------------------------------------
+                        # Instead of resizing the original clip (which uses ANTIALIAS),
+                        # we'll create a new CompositeVideoClip with the avatar
+                        # This avoids both the ANTIALIAS and transform errors
+                        
+                        # Calculate desired height (40% of background)
+                        target_height = int(bg_clip.h * 0.40)
+                        # Calculate width while preserving aspect ratio
+                        target_width = int(target_height * (avatar_clip.w / avatar_clip.h))
+                        
+                        print(f"  Target avatar size: {target_width}x{target_height}")
+                        
+                        # Position at bottom-left
+                        avatar_position = (0, bg_clip.h - target_height)
+                        print(f"  Avatar position: {avatar_position}")
+                        
+                        # Create a new clip that's the right size by compositing
+                        # the avatar onto a transparent background
+                        resized_avatar = CompositeVideoClip(
+                            [avatar_clip.set_position("center")],
+                            size=(target_width, target_height)
+                        ).set_duration(avatar_clip.duration)
+                        
+                        # Set the position of this new clip
+                        resized_avatar = resized_avatar.set_position(avatar_position)
+                        
+                        # Keep the audio from the original avatar
+                        resized_avatar = resized_avatar.set_audio(avatar_clip.audio)
+                        
+                        print(f"  Created resized avatar: {resized_avatar.size}")
+
+                        # --- Sync durations so *longer* track defines final length -----
+                        if bg_clip.duration < resized_avatar.duration:
+                            print(f"  Background ({bg_clip.duration:.2f}s) shorter than avatar "
+                                  f"({resized_avatar.duration:.2f}s) – looping background.")
+                            loop_count = math.ceil(resized_avatar.duration / bg_clip.duration)
+                            bg_clip = concatenate_videoclips([bg_clip] * loop_count) \
+                                      .subclip(0, resized_avatar.duration)
+                        elif resized_avatar.duration < bg_clip.duration:
+                            print(f"  Avatar ({resized_avatar.duration:.2f}s) shorter than background "
+                                  f"({bg_clip.duration:.2f}s) – looping avatar.")
+                            loop_count = math.ceil(bg_clip.duration / resized_avatar.duration)
+                            resized_avatar = concatenate_videoclips([resized_avatar] * loop_count) \
+                                             .subclip(0, bg_clip.duration)
+
+                        print(f"  Synced durations → BG: {bg_clip.duration:.2f}s | "
+                              f"Avatar: {resized_avatar.duration:.2f}s")
+
+                        # 2. Loop avatar if it's shorter than BG
+                        if resized_avatar.duration < bg_clip.duration:
+                            print(f"  Looping avatar (duration {resized_avatar.duration:.2f}s) "
+                                  f"to match background ({bg_clip.duration:.2f}s)")
+                            loop_count = math.ceil(bg_clip.duration / resized_avatar.duration)
+                            resized_avatar = concatenate_videoclips(
+                                [resized_avatar] * loop_count
+                            ).subclip(0, bg_clip.duration)
+                        else:
+                            print(f"  Trimming avatar (duration {resized_avatar.duration:.2f}s) "
+                                  f"to match background ({bg_clip.duration:.2f}s)")
+                            resized_avatar = resized_avatar.subclip(0, bg_clip.duration)
+                        print(f"  Avatar duration adjusted to: {resized_avatar.duration:.2f}s")
+
+                        # 3. Place bottom‑left  (already done via `resized_avatar`)
+                        avatar_clip = avatar_clip.set_position(("left", "bottom"))
+                        print(f"  Avatar position set to: left, bottom")
+
+                        # --- Create final composite ---
+                        print(f"  Creating final composite with background and avatar")
+                        composite = CompositeVideoClip(
+                            [bg_clip, resized_avatar], 
+                            size=bg_clip.size
+                        ).set_audio(resized_avatar.audio)
+                        print(f"  Composite created with size={composite.size}, duration={composite.duration:.2f}s")
+
+                        composite.write_videofile(
+                            final_video_path,
+                            codec="libx264",
+                            audio_codec="aac",
+                            temp_audiofile="temp-avatar-audio.m4a",
+                            remove_temp=True,
+                            preset="medium",
+                            ffmpeg_params=["-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p"]
+                        )
+
+                        composite.close(); bg_clip.close(); avatar_clip.close()
                     except Exception as e:
-                        print(f"Overlay failed: {e}")
-                        # Fallback: Use the D-ID video without overlay
-                        final_video_path = temp_did_video_path
+                        print(f"Composite failed: {e}")
+                        # fallback to avatar‑only video if composite fails
+                        final_video_path     = temp_did_video_path
                         final_video_filename = temp_video_filename
-                else:
-                    print("No overlay image selected or found. Using D-ID video directly.")
-                    final_video_path = temp_did_video_path
-                    final_video_filename = temp_video_filename
 
         elif video_type == 'product':
             print("--- Generating Confirmed Product Slideshow Video ---")
